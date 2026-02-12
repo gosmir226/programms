@@ -1,0 +1,15 @@
+__pycache__/
+*.py[cod]
+*$py.class
+.venv/
+venv/
+ENV/
+*.log
+last_paths.json
+cache.json
+decision_table_T.json
+.vscode/
+.idea/
+*.xlsx
+*.csv
+*.tdms
