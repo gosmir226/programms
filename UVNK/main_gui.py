@@ -5,9 +5,17 @@ import json
 from PyQt6.QtWidgets import (
     QApplication, QWidget, QLabel, QLineEdit, QPushButton,
     QFileDialog, QTextEdit, QVBoxLayout, QHBoxLayout,
-    QFrame, QMessageBox
+    QFrame, QMessageBox, QSizeGrip
 )
 from PyQt6.QtCore import Qt, pyqtSignal
+
+# Добавляем родительскую директорию в путь для импорта общих модулей
+sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+try:
+    from cache_manager import CacheManager
+except ImportError:
+    CacheManager = None
+
 from data_orchestrator import process_session_to_excel
 
 # === UNIFIED THEME CONSTANTS ===
@@ -33,7 +41,7 @@ THEME_STYLESHEET = """
     }
     QLabel#header_label {
         font-size: 18px;
-        color: #3498db;
+        color: #2ecc71;
         font-weight: bold;
     }
     
@@ -47,7 +55,7 @@ THEME_STYLESHEET = """
         font-size: 13px;
     }
     QLineEdit:focus {
-        border-color: #3498db;
+        border-color: #2ecc71;
     }
     
     /* Buttons */
@@ -69,12 +77,27 @@ THEME_STYLESHEET = """
     
     /* Primary Action Button */
     QPushButton#primary_btn {
-        background-color: #3498db;
-        border-color: #2980b9;
+        background-color: #2ecc71;
+        border-color: #27ae60;
     }
     QPushButton#primary_btn:hover {
-        background-color: #2980b9;
-        border-color: #1f618d;
+        background-color: #27ae60;
+        border-color: #2ecc71;
+    }
+
+    /* Secondary Button (Clear Cache) */
+    QPushButton#secondary_btn {
+        background-color: #e67e22;
+        border-color: #d35400;
+    }
+    QPushButton#secondary_btn:hover {
+        background-color: #d35400;
+        border-color: #a04000;
+    }
+    QPushButton#secondary_btn:disabled {
+        background-color: #444444;
+        color: #888888;
+        border-color: #333333;
     }
     
     /* Logs */
@@ -86,6 +109,17 @@ THEME_STYLESHEET = """
         color: #cccccc;
         font-family: "Consolas", monospace;
         font-size: 12px;
+    }
+
+    /* Progress Bar */
+    QProgressBar {
+        border: 1px solid #3d3d3d;
+        border-radius: 5px;
+        text-align: center;
+        background-color: #1e1e1e;
+    }
+    QProgressBar::chunk {
+        background-color: #2ecc71;
     }
 """
 
@@ -108,7 +142,7 @@ class CustomTitleBar(QFrame):
         layout.setSpacing(0)
         
         # Icon/Title
-        self.title_label = QLabel("UVNK: Обработка данных")
+        self.title_label = QLabel(self.window_parent.windowTitle())
         layout.addWidget(self.title_label)
         layout.addStretch()
         
@@ -130,7 +164,6 @@ class CustomTitleBar(QFrame):
         layout.addWidget(self.btn_max)
         layout.addWidget(self.btn_close)
         
-        # Dragging variables
         self.click_pos = None
 
     def toggle_max(self):
@@ -154,26 +187,25 @@ class CustomTitleBar(QFrame):
     def mouseReleaseEvent(self, event):
         self.click_pos = None
 
-from PyQt6.QtWidgets import QSizeGrip, QSizePolicy
-
 class App(QWidget):
     log_signal = pyqtSignal(str)
+    finished_signal = pyqtSignal()
 
     def __init__(self):
         super().__init__()
         self.setWindowTitle("UVNK: Обработка данных температур")
-        self.resize(900, 700)
+        self.resize(900, 750)
         
         # Frameless Setup
         self.setWindowFlags(Qt.WindowType.FramelessWindowHint | Qt.WindowType.WindowSystemMenuHint)
         self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
         
-        # Main Layout (Fill entire widget)
+        # Main Layout
         outer_layout = QVBoxLayout(self)
         outer_layout.setContentsMargins(0, 0, 0, 0)
         outer_layout.setSpacing(0)
         
-        # Main Container (Visible Border)
+        # Main Container
         self.main_container = QFrame()
         self.main_container.setObjectName("MainContainer")
         self.main_container.setStyleSheet(f"""
@@ -202,13 +234,14 @@ class App(QWidget):
         self.init_inner_ui(content_widget)
         
         self.log_signal.connect(self.log_text.append)
+        self.finished_signal.connect(self.on_processing_finished)
         
-        # 3. Resize Grip (Manual placement)
+        # 3. Resize Grip
         self.grip = QSizeGrip(self.main_container)
         self.grip.setFixedSize(20, 20)
-        self.grip.setStyleSheet("background: transparent;")
         
         self.load_last_paths()
+        self.update_cache_button_state()
 
     def resizeEvent(self, event):
         if hasattr(self, 'grip'):
@@ -229,8 +262,7 @@ class App(QWidget):
         input_frame = QFrame()
         input_frame.setObjectName("input_frame")
         input_layout = QVBoxLayout(input_frame) 
-        
-        lbl_in = QLabel("📂 Папка с данными (Pasport/Reports)")
+        input_layout.addWidget(QLabel("📂 Папка с данными (Pasport/Reports)"))
         
         h_in = QHBoxLayout()
         self.input_path = QLineEdit()
@@ -238,11 +270,8 @@ class App(QWidget):
         self.btn_input = QPushButton("Обзор...")
         self.btn_input.setCursor(Qt.CursorShape.PointingHandCursor)
         self.btn_input.clicked.connect(self.select_input_folder)
-        
         h_in.addWidget(self.input_path)
         h_in.addWidget(self.btn_input)
-        
-        input_layout.addWidget(lbl_in)
         input_layout.addLayout(h_in)
         main_layout.addWidget(input_frame)
 
@@ -250,21 +279,27 @@ class App(QWidget):
         output_frame = QFrame()
         output_frame.setObjectName("output_frame")
         output_layout = QVBoxLayout(output_frame)
-        
-        lbl_out = QLabel("📄 Файл результата (.xlsx)")
+        output_layout.addWidget(QLabel("📄 Файл результата (.xlsx)"))
         
         h_out = QHBoxLayout()
         self.output_path = QLineEdit()
         self.output_path.setPlaceholderText("Укажите, куда сохранить результат...")
+        self.output_path.textChanged.connect(self.update_cache_button_state)
         self.btn_output = QPushButton("Выбрать...")
         self.btn_output.setCursor(Qt.CursorShape.PointingHandCursor)
         self.btn_output.clicked.connect(self.select_output_file)
-        
         h_out.addWidget(self.output_path)
         h_out.addWidget(self.btn_output)
-        
-        output_layout.addWidget(lbl_out)
         output_layout.addLayout(h_out)
+        
+        # === Кнопка очистки кэша ===
+        self.btn_clear_cache = QPushButton("🧹 Очистить кэш")
+        self.btn_clear_cache.setObjectName("secondary_btn")
+        self.btn_clear_cache.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_clear_cache.clicked.connect(self.clear_cache)
+        self.btn_clear_cache.setEnabled(False)
+        output_layout.addWidget(self.btn_clear_cache)
+        
         main_layout.addWidget(output_frame)
 
         # === Кнопка запуска ===
@@ -281,7 +316,10 @@ class App(QWidget):
         self.log_text.setReadOnly(True)
         main_layout.addWidget(self.log_text)
 
-        folder_path = QFileDialog.getExistingDirectory(self, "Выберите папку сессии", "")
+    def select_input_folder(self):
+        current_path = self.input_path.text().strip()
+        start_dir = current_path if current_path and os.path.exists(current_path) else ""
+        folder_path = QFileDialog.getExistingDirectory(self, "Выберите папку сессии", start_dir)
         if folder_path:
             self.input_path.setText(folder_path)
             self.save_last_paths()
@@ -292,7 +330,8 @@ class App(QWidget):
         
         file_path, _ = QFileDialog.getSaveFileName(
             self, "Сохранить отчет как...", start_dir,
-            "Excel Files (*.xlsx);;All Files (*)"
+            "Excel Files (*.xlsx);;All Files (*)",
+            options=QFileDialog.Option.DontConfirmOverwrite
         )
         if file_path:
             if not file_path.lower().endswith('.xlsx'):
@@ -300,6 +339,24 @@ class App(QWidget):
             self.output_path.setText(file_path)
             self.save_last_paths()
             
+    def update_cache_button_state(self):
+        path = self.output_path.text().strip()
+        self.btn_clear_cache.setEnabled(bool(path))
+
+    def clear_cache(self):
+        output_file = self.output_path.text().strip()
+        if not output_file: return
+            
+        if CacheManager:
+            cache = CacheManager("UVNK", output_file)
+            if cache.clear_cache():
+                self.log_text.append("✅ Кэш успешно очищен.")
+                QMessageBox.information(self, "Успех", "Кэш для данного файла очищен.")
+            else:
+                QMessageBox.warning(self, "Ошибка", "Не удалось очистить кэш.")
+        else:
+            QMessageBox.critical(self, "Ошибка", "Модуль управления кэшем не найден.")
+
     def load_last_paths(self):
         config_file = os.path.join(os.path.dirname(os.path.abspath(__file__)), "last_paths.json")
         if os.path.exists(config_file):
@@ -308,31 +365,26 @@ class App(QWidget):
                     data = json.load(f)
                     self.input_path.setText(data.get("input", ""))
                     self.output_path.setText(data.get("output", ""))
-            except Exception:
-                pass
+            except Exception: pass
 
     def save_last_paths(self):
         config_file = os.path.join(os.path.dirname(os.path.abspath(__file__)), "last_paths.json")
-        data = {
-            "input": self.input_path.text().strip(),
-            "output": self.output_path.text().strip()
-        }
+        data = {"input": self.input_path.text().strip(), "output": self.output_path.text().strip()}
         try:
             with open(config_file, "w", encoding="utf-8") as f:
                 json.dump(data, f, ensure_ascii=False, indent=2)
-        except Exception:
-            pass
+        except Exception: pass
 
     def start_processing(self):
         input_folder = self.input_path.text().strip()
         output_file = self.output_path.text().strip()
         
         if not input_folder or not output_file:
-            QMessageBox.warning(self, "Внимание", "Необходимо заполнить оба поля:\n1. Папка с данными\n2. Файл результата")
+            QMessageBox.warning(self, "Внимание", "Необходимо заполнить оба поля!")
             return
 
-        # Disable UI to prevent double click
         self.run_button.setEnabled(False)
+        self.btn_clear_cache.setEnabled(False)
         self.run_button.setText("⏳ Выполняется обработка...")
         
         thread = threading.Thread(target=self.run_processing, args=(input_folder, output_file))
@@ -349,9 +401,12 @@ class App(QWidget):
         except Exception as e:
             self.log_signal.emit(f"\n❌ КРИТИЧЕСКАЯ ОШИБКА: {str(e)}")
         finally:
-            # Not easy to re-enable button from thread in PyQt thread-safety rules generally, 
-            # but for simple cases in Python it sometimes works. 
-            pass
+            self.finished_signal.emit()
+
+    def on_processing_finished(self):
+        self.run_button.setEnabled(True)
+        self.update_cache_button_state()
+        self.run_button.setText("🚀 ЗАПУСТИТЬ ОБРАБОТКУ")
 
 if __name__ == "__main__":
     app = QApplication(sys.argv)

@@ -1,19 +1,28 @@
 import os
 import pandas as pd
 import json
-import hashlib
 import re
+import hashlib
 from datetime import datetime
 from openpyxl import load_workbook
 import traceback
+import sys
+
+# Добавляем родительскую директорию в путь для импорта общих модулей
+sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+try:
+    from excel_manager import ExcelManager
+    from cache_manager import CacheManager
+except ImportError:
+    ExcelManager = None
+    CacheManager = None
 
 class TurnProcessor:
-    def __init__(self, directory, log_callback=None, progress_callback=None):
+    def __init__(self, directory, output_file=None, log_callback=None, progress_callback=None):
         self.directory = directory
+        self.output_file = output_file or os.path.join(directory, 'consolidated_results.xlsx')
         self.log_callback = log_callback
         self.progress_callback = progress_callback
-        self.cache_file = os.path.join(directory, 'processing_cache.json')
-        self.cache_data = {}
 
     def log_message(self, message):
         if self.log_callback:
@@ -25,86 +34,6 @@ class TurnProcessor:
         if self.progress_callback:
             self.progress_callback(value)
 
-    def get_file_hash(self, filepath):
-        """Вычисляет хэш содержимого файла"""
-        try:
-            hash_sha = hashlib.sha256()
-            with open(filepath, "rb") as f:
-                for chunk in iter(lambda: f.read(4096), b""):
-                    hash_sha.update(chunk)
-            return hash_sha.hexdigest()
-        except Exception as e:
-            self.log_message(f"Ошибка при вычислении хэша {filepath}: {str(e)}")
-            return None
-
-    def load_cache(self):
-        """Загружает кэш из JSON файла"""
-        if os.path.exists(self.cache_file):
-            try:
-                with open(self.cache_file, 'r', encoding='utf-8') as f:
-                    self.cache_data = json.load(f)
-                self.log_message(f"Загружено {len(self.cache_data)} записей из кэша")
-                return True
-            except Exception as e:
-                self.log_message(f"Ошибка при загрузке кэша: {str(e)}")
-                self.cache_data = {}
-                return False
-        else:
-            self.cache_data = {}
-            return True
-
-    def save_cache(self):
-        """Сохраняет кэш в JSON файл"""
-        try:
-            with open(self.cache_file, 'w', encoding='utf-8') as f:
-                json.dump(self.cache_data, f, ensure_ascii=False, indent=2)
-            return True
-        except Exception as e:
-            self.log_message(f"Ошибка при сохранении кэша: {str(e)}")
-            return False
-
-    def is_file_modified(self, file_path):
-        """Проверяет, был ли файл изменен с момента последней обработки"""
-        if file_path not in self.cache_data:
-            return True  # Файл новый
-        
-        cache_entry = self.cache_data[file_path]
-        
-        try:
-            # Проверяем время модификации
-            current_mtime = os.path.getmtime(file_path)
-            if current_mtime != cache_entry.get("last_modified"):
-                return True
-            
-            # Проверяем хэш содержимого
-            current_hash = self.get_file_hash(file_path)
-            if current_hash != cache_entry.get("hash"):
-                return True
-            
-            return False  # Файл не изменился
-            
-        except Exception as e:
-            self.log_message(f"Ошибка при проверке файла {file_path}: {str(e)}")
-            return True  # В случае ошибки считаем файл измененным
-
-    def update_cache(self, file_path):
-        """Обновляет кэш для файла"""
-        try:
-            current_mtime = os.path.getmtime(file_path)
-            current_hash = self.get_file_hash(file_path)
-            
-            self.cache_data[file_path] = {
-                "last_modified": current_mtime,
-                "hash": current_hash,
-                "last_processed": datetime.now().isoformat(),
-                "file_size": os.path.getsize(file_path)
-            }
-            # Сохраняем кэш после каждого обновления
-            self.save_cache()
-            
-        except Exception as e:
-            self.log_message(f"Ошибка при обновлении кэша для {file_path}: {str(e)}")
-
     def clean_header(self, header):
         """Очищает заголовок от лишних пробелов"""
         if pd.isna(header):
@@ -112,31 +41,6 @@ class TurnProcessor:
         header_str = str(header).strip()
         header_str = re.sub(r'\s+', ' ', header_str)
         return header_str
-
-    def get_visible_sheets(self, file_path):
-        """Возвращает список видимых листов в файле Excel"""
-        try:
-            wb = load_workbook(file_path, read_only=True)
-            visible_sheets = []
-            for sheet_name in wb.sheetnames:
-                sheet = wb[sheet_name]
-                if sheet.sheet_state == 'visible':
-                    visible_sheets.append(sheet_name)
-            wb.close()
-            return visible_sheets
-        except Exception as e:
-            self.log_message(f"Ошибка при определении видимых листов {file_path}: {str(e)}")
-            return []
-
-    def find_table_start(self, df):
-        """Находит начальные координаты таблицы в DataFrame"""
-        for row_idx in range(len(df)):
-            for col_idx in range(len(df.columns)):
-                if pd.notna(df.iloc[row_idx, col_idx]):
-                    row_values = df.iloc[row_idx, col_idx:]
-                    if row_values.notna().sum() >= 2:
-                        return row_idx, col_idx
-        return None, None
 
     def standardize_headers(self, headers):
         """Стандартизирует заголовки согласно mapping с обработкой дубликатов"""
@@ -202,8 +106,7 @@ class TurnProcessor:
             return None, None
         
         melt_str = str(melt_string).strip()
-        
-        match = re.search(r'(\d+)[В](\d+)', melt_str, re.IGNORECASE)
+        match = re.search(r'(\d+)[ВB](\d+)', melt_str, re.IGNORECASE)
         if match:
             year = match.group(1)
             number = match.group(2)
@@ -221,7 +124,6 @@ class TurnProcessor:
         """Определяет статус на основе числового значения"""
         try:
             num_value = float(value)
-            
             if (-50 <= num_value <= -45) or (35 <= num_value <= 50):
                 return "ОТРЫВ"
             elif (-40 <= num_value <= -30) or (20 <= num_value <= 30):
@@ -235,17 +137,16 @@ class TurnProcessor:
 
     def process_atos_rejection(self, df):
         """Обрабатывает столбцы для определения брака АТОС и обновления статуса"""
-        standard_statuses = ["ГОД", "БРАК", "ТР", "ОТРЫВ", "год", "брак", "тр", "отрыв"]
+        standard_statuses = ["ГОД", "БРАК", "ТР", "ОТРЫВ", "ГОДН"]
         df['Брак АТОС'] = None
         
         atos_columns = ['Замер', 'Замер факт', 'Значение разворота по приспособлению ОДК-Климов', 
                        'Значение разворота по приспособлению к4', 'Значение разворота по приспособлению к2']
-        
         correction_columns = ['Замер с поправкой']
         
         for idx, row in df.iterrows():
-            current_status = str(row.get('Статус', '')).strip() if pd.notna(row.get('Статус')) else ''
-            contains_viz = 'ВИЗ' in current_status.upper()
+            current_status = str(row.get('Статус', '')).strip().upper() if pd.notna(row.get('Статус')) else ''
+            contains_viz = 'ВИЗ' in current_status
             
             atos_detected = False
             for col in atos_columns:
@@ -257,7 +158,6 @@ class TurnProcessor:
             
             if current_status not in standard_statuses and not contains_viz:
                 measurement_value = None
-                
                 if atos_detected:
                     for col in correction_columns:
                         if col in df.columns and pd.notna(row.get(col)):
@@ -290,6 +190,52 @@ class TurnProcessor:
                     df.at[idx, 'Статус'] = new_status
         
         return df
+
+    def find_table_start(self, df):
+        """Находит начальные координаты таблицы в DataFrame"""
+        for row_idx in range(len(df)):
+            for col_idx in range(len(df.columns)):
+                if pd.notna(df.iloc[row_idx, col_idx]):
+                    row_values = df.iloc[row_idx, col_idx:]
+                    if row_values.notna().sum() >= 2:
+                        return row_idx, col_idx
+        return None, None
+
+    def analyze_file_structure(self, file_path):
+        """Анализирует структуру файла: количество листов и общее количество строк"""
+        try:
+            workbook = load_workbook(file_path, read_only=True)
+            sheets_count = len(workbook.sheetnames)
+            total_rows = 0
+            for sheet_name in workbook.sheetnames:
+                sheet = workbook[sheet_name]
+                row_count = 0
+                for row in sheet.iter_rows():
+                    if any(cell.value is not None for cell in row):
+                        row_count += 1
+                total_rows += row_count
+            workbook.close()
+            return sheets_count, total_rows
+        except Exception:
+            return 0, 0
+
+    def extract_cassette_from_filename(self, file_path):
+        filename = os.path.basename(file_path)
+        match = re.search(r'№\s*(\d+)', filename)
+        return match.group(1) if match else None
+
+    def extract_cassette_from_sheetname(self, sheet_name):
+        match = re.search(r'№\s*(\d+)', sheet_name)
+        return match.group(1) if match else None
+
+    def extract_cassette_and_measurement_info(self, file_path, sheet_name, file_type, measurement_rank=1):
+        if file_type == 'первичный':
+            cassette_number = self.extract_cassette_from_filename(file_path)
+            measurement_number = 0
+        else:
+            cassette_number = self.extract_cassette_from_sheetname(sheet_name)
+            measurement_number = measurement_rank
+        return cassette_number, measurement_number
 
     def determine_file_types_in_folder(self, folder_path):
         """Определяет тип файлов в папке"""
@@ -326,7 +272,8 @@ class TurnProcessor:
                     })
                 
                 file_stats.sort(key=lambda x: (x['sheets_count'], x['total_rows']), reverse=True)
-                
+                if not file_stats: return file_types
+
                 max_sheets = max(stats['sheets_count'] for stats in file_stats)
                 files_with_max_sheets = [stats for stats in file_stats if stats['sheets_count'] == max_sheets]
                 
@@ -343,50 +290,19 @@ class TurnProcessor:
         
         return file_types
 
-    def analyze_file_structure(self, file_path):
-        """Анализирует структуру файла"""
+    def get_visible_sheets(self, file_path):
+        """Возвращает список видимых листов в файле Excel"""
         try:
-            workbook = load_workbook(file_path, read_only=True)
-            sheets_count = len(workbook.sheetnames)
-            total_rows = 0
-            
-            for sheet_name in workbook.sheetnames:
-                sheet = workbook[sheet_name]
-                row_count = 0
-                for row in sheet.iter_rows():
-                    if any(cell.value is not None for cell in row):
-                        row_count += 1
-                total_rows += row_count
-            
-            workbook.close()
-            return sheets_count, total_rows
-        except Exception as e:
-            self.log_message(f"Ошибка при анализе файла {file_path}: {str(e)}")
-            return 0, 0
-
-    def extract_cassette_and_measurement_info(self, file_path, sheet_name, file_type, measurement_rank=1):
-        """Извлекает номер кассеты и номер замера"""
-        if file_type == 'первичный':
-            cassette_number = self.extract_cassette_from_filename(file_path)
-            measurement_number = 0
-        else:
-            cassette_number = self.extract_cassette_from_sheetname(sheet_name)
-            measurement_number = measurement_rank
-        
-        return cassette_number, measurement_number, file_type == 'перезамер'
-
-    def extract_cassette_from_filename(self, file_path):
-        filename = os.path.basename(file_path)
-        match = re.search(r'№\s*(\d+)', filename)
-        if match:
-            return match.group(1)
-        return None
-
-    def extract_cassette_from_sheetname(self, sheet_name):
-        match = re.search(r'№\s*(\d+)', sheet_name)
-        if match:
-            return match.group(1)
-        return None
+            wb = load_workbook(file_path, read_only=True)
+            visible_sheets = []
+            for sheet_name in wb.sheetnames:
+                sheet = wb[sheet_name]
+                if sheet.sheet_state == 'visible':
+                    visible_sheets.append(sheet_name)
+            wb.close()
+            return visible_sheets
+        except Exception:
+            return []
 
     def process_excel_file(self, file_path, file_type):
         """Обрабатывает один Excel-файл"""
@@ -394,204 +310,180 @@ class TurnProcessor:
             visible_sheets = self.get_visible_sheets(file_path)
             if not visible_sheets:
                 return pd.DataFrame()
-            
+                
             excel_file = pd.ExcelFile(file_path)
             file_dataframes = []
             
-            # Для перезамеров
             sheet_stats = []
             if file_type == 'перезамер':
                 for sheet_name in visible_sheets:
                     if sheet_name not in excel_file.sheet_names: continue
-                        
                     df = pd.read_excel(excel_file, sheet_name=sheet_name, header=None, engine='openpyxl')
                     start_row, start_col = self.find_table_start(df)
                     if start_row is None: continue
                     
-                    table_df = df.iloc[start_row:, start_col:].copy().reset_index(drop=True)
+                    table_df = df.iloc[start_row:, start_col:].copy()
+                    table_df = table_df.reset_index(drop=True)
                     if len(table_df) > 0:
                         original_headers = [str(h) if pd.notna(h) else f"Unnamed_{i}" for i, h in enumerate(table_df.iloc[0])]
                         table_df.columns = original_headers
                         table_df = table_df.drop(0).reset_index(drop=True)
-                    
-                    if len(table_df) == 0 or len(table_df.columns) == 0: continue
-                    
-                    if 'Плавка' in table_df.columns:
-                        table_df = table_df[table_df['Плавка'].notna()]
-                        table_df = table_df[table_df['Плавка'].astype(str).str.strip() != '']
-                    
-                    sheet_stats.append({'sheet_name': sheet_name, 'row_count': len(table_df), 'table_df': table_df})
-            
-                sheet_stats.sort(key=lambda x: x['row_count'], reverse=True)
-                
-                for rank, stat in enumerate(sheet_stats, 1):
-                    table_df = stat['table_df']
-                    sheet_name = stat['sheet_name']
-                    self.process_dataframe(table_df, file_path, sheet_name, file_type, 
-                                            rank, file_dataframes)
-            else:
-                # Первичный файл
-                for sheet_name in visible_sheets:
-                    if sheet_name not in excel_file.sheet_names: continue
-                    
-                    df = pd.read_excel(excel_file, sheet_name=sheet_name, header=None, engine='openpyxl')
-                    start_row, start_col = self.find_table_start(df)
-                    if start_row is None: continue
-                    
-                    table_df = df.iloc[start_row:, start_col:].copy().reset_index(drop=True)
-                    if len(table_df) > 0:
-                        original_headers = [str(h) if pd.notna(h) else f"Unnamed_{i}" for i, h in enumerate(table_df.iloc[0])]
-                        table_df.columns = original_headers
-                        table_df = table_df.drop(0).reset_index(drop=True)
-                    
-                    if len(table_df) == 0 or len(table_df.columns) == 0: continue
-                    
-                    if 'Плавка' in table_df.columns:
-                        table_df = table_df[table_df['Плавка'].notna()]
-                        table_df = table_df[table_df['Плавка'].astype(str).str.strip() != '']
                     
                     if len(table_df) == 0: continue
+                    if 'Плавка' in table_df.columns:
+                        table_df = table_df[table_df['Плавка'].notna()]
                     
-                    self.process_dataframe(table_df, file_path, sheet_name, file_type, 
-                                            1, file_dataframes)
+                    sheet_stats.append({'sheet_name': sheet_name, 'row_count': len(table_df), 'table_df': table_df})
+                
+                sheet_stats.sort(key=lambda x: x['row_count'], reverse=True)
+                for rank, stat in enumerate(sheet_stats, 1):
+                    df_proc = self.finalize_dataframe(stat['table_df'], file_path, stat['sheet_name'], file_type, rank)
+                    if not df_proc.empty: file_dataframes.append(df_proc)
+            else:
+                for sheet_name in visible_sheets:
+                    df = pd.read_excel(excel_file, sheet_name=sheet_name, header=None, engine='openpyxl')
+                    start_row, start_col = self.find_table_start(df)
+                    if start_row is None: continue
+                    
+                    table_df = df.iloc[start_row:, start_col:].copy()
+                    table_df = table_df.reset_index(drop=True)
+                    if len(table_df) > 0:
+                        original_headers = [str(h) if pd.notna(h) else f"Unnamed_{i}" for i, h in enumerate(table_df.iloc[0])]
+                        table_df.columns = original_headers
+                        table_df = table_df.drop(0).reset_index(drop=True)
+                    
+                    if len(table_df) == 0: continue
+                    if 'Плавка' in table_df.columns:
+                        table_df = table_df[table_df['Плавка'].notna()]
+                    
+                    df_proc = self.finalize_dataframe(table_df, file_path, sheet_name, file_type)
+                    if not df_proc.empty: file_dataframes.append(df_proc)
             
             if file_dataframes:
                 return pd.concat(file_dataframes, ignore_index=True, sort=False)
-            else:
-                return pd.DataFrame()
-            
+            return pd.DataFrame()
         except Exception as e:
-            self.log_message(f"Ошибка при обработке файла {file_path}: {str(e)}")
+            self.log_message(f"Ошибка в process_excel_file {file_path}: {e}")
             return pd.DataFrame()
 
-    def process_dataframe(self, table_df, file_path, sheet_name, file_type, rank, file_dataframes):
-        """Вспомогательная функция для обработки DataFrame"""
-        standardized_headers = self.standardize_headers(table_df.columns)
-        table_df.columns = standardized_headers
+    def finalize_dataframe(self, table_df, file_path, sheet_name, file_type, rank=1):
+        if table_df.empty: return table_df
         
-        table_df = self.process_coefficient_column(table_df, standardized_headers)
+        headers = self.standardize_headers(table_df.columns)
+        table_df.columns = headers
+        table_df = self.process_coefficient_column(table_df, headers)
         
         if 'Плавка' in table_df.columns:
             melt_info = table_df['Плавка'].apply(self.extract_melt_info)
             table_df['Год плавки'] = melt_info.apply(lambda x: x[0] if x else None)
             table_df['Номер плавки'] = melt_info.apply(lambda x: x[1] if x else None)
-        
-        table_df = self.process_atos_rejection(table_df)
-        
-        cassette_number, measurement_number, is_remeasure = self.extract_cassette_and_measurement_info(
-            file_path, sheet_name, file_type, rank
-        )
-        
-        table_df['Имя файла'] = os.path.basename(file_path)
-        table_df['Номер замера'] = measurement_number
-        table_df['Номер кассеты'] = cassette_number
-        table_df['Тип файла'] = 'Перезамер' if is_remeasure else 'Первичный'
-        table_df['Полный путь'] = file_path
-        
-        if 'Плавка' in table_df.columns:
             table_df = table_df.rename(columns={'Плавка': 'Полный номер плавки'})
         
-        file_dataframes.append(table_df)
+        table_df = self.process_atos_rejection(table_df)
+        cassette, measurement = self.extract_cassette_and_measurement_info(file_path, sheet_name, file_type, rank)
+        
+        table_df['Имя файла'] = os.path.basename(file_path)
+        table_df['Номер замера'] = measurement
+        table_df['Номер кассеты'] = cassette
+        table_df['Тип файла'] = 'Перезамер' if file_type == 'перезамер' else 'Первичный'
+        table_df['Полный путь'] = file_path
+        
+        return table_df
 
     def process(self):
         try:
-            self.log_message("Загрузка кэша...")
-            if not self.load_cache():
-                self.log_message("Ошибка при загрузке кэша")
-                return pd.DataFrame()
+            result_path = self.output_file
             
-            result_path = os.path.join(self.directory, 'consolidated_results.xlsx')
-            existing_data = pd.DataFrame()
-            if os.path.exists(result_path):
-                try:
-                    existing_data = pd.read_excel(result_path, engine='openpyxl')
-                    self.log_message(f"Загружено {len(existing_data)} записей из существующих результатов")
-                except Exception as e:
-                    self.log_message(f"Ошибка при загрузке существующих результатов: {str(e)}")
-            
-            new_data = pd.DataFrame()
-            modified_files = []
+            if CacheManager:
+                cache = CacheManager("feather_turn", result_path)
+            else:
+                cache = None
+                
+            if ExcelManager:
+                excel_manager = ExcelManager(result_path)
+            else:
+                excel_manager = None
+
+            new_data_frames = []
             folders = [f for f in os.listdir(self.directory) 
-                      if os.path.isdir(os.path.join(self.directory, f))]
-            total_folders = len(folders)
+                      if os.path.isdir(os.path.join(self.directory, f)) and f != '__pycache__']
             
+            # Если в самой директории есть файлы, добавим и её для анализа (некоторые пользователи кладут файлы прямо туда)
+            folders = ['.'] + folders
+            
+            total_folders = len(folders)
             processed_files_count = 0
             skipped_files_count = 0
-            modified_files_count = 0
             
             for folder_idx, folder in enumerate(folders):
-                folder_path = os.path.join(self.directory, folder)
-                
-                self.log_message(f"Анализ типов файлов в папке: {folder}")
-                file_types = self.determine_file_types_in_folder(folder_path)
+                folder_path = os.path.join(self.directory, folder) if folder != '.' else self.directory
                 
                 xlsx_files = [f for f in os.listdir(folder_path) 
-                             if f.lower().endswith('.xlsx')]
+                             if f.lower().endswith('.xlsx') and not f.startswith('~$')]
+                
+                # Исключаем выходной файл
+                xlsx_files = [f for f in xlsx_files if os.path.abspath(os.path.join(folder_path, f)) != os.path.abspath(result_path)]
                 
                 if not xlsx_files: continue
+                
+                self.log_message(f"Анализ папки: {folder if folder != '.' else 'Корень'}")
+                file_types = self.determine_file_types_in_folder(folder_path)
                 
                 xlsx_files_with_paths = [(f, os.path.join(folder_path, f)) for f in xlsx_files]
                 xlsx_files_with_paths.sort(key=lambda x: os.path.getmtime(x[1]))
                 
-                for file_idx, (filename, file_path) in enumerate(xlsx_files_with_paths):
+                for filename, file_path in xlsx_files_with_paths:
                     file_type = file_types.get(filename, 'первичный')
+                    abs_file_path = os.path.abspath(file_path)
                     
-                    if not self.is_file_modified(file_path):
-                        self.log_message(f"Пропуск (не изменился): {folder}/{filename}")
+                    if cache and not cache.is_file_changed(abs_file_path):
                         skipped_files_count += 1
                         continue
                     
-                    self.log_message(f"Обработка ({file_type}): {folder}/{filename}")
-                    modified_files.append(file_path)
-                    
+                    self.log_message(f"  Обработка ({file_type}): {filename}")
                     file_data = self.process_excel_file(file_path, file_type)
                     
                     if not file_data.empty:
-                        if new_data.empty:
-                            new_data = file_data
-                        else:
-                            new_data = pd.concat([new_data, file_data], ignore_index=True, sort=False)
-                        
-                        self.update_cache(file_path)
+                        new_data_frames.append(file_data)
+                        if cache:
+                            cache.update_file(abs_file_path)
                         processed_files_count += 1
-                        
-                        if file_path in self.cache_data:
-                            modified_files_count += 1
                     else:
-                        self.update_cache(file_path)
+                        if cache: cache.update_file(abs_file_path)
                 
                 self.update_progress(int((folder_idx + 1) / total_folders * 100))
             
-            if not existing_data.empty and modified_files:
-                self.log_message("Удаление старых записей измененных файлов...")
-                keep_mask = pd.Series([True] * len(existing_data), index=existing_data.index)
+            if new_data_frames:
+                self.log_message("Объединение новых данных...")
+                final_new_data = pd.concat(new_data_frames, ignore_index=True, sort=False)
                 
-                for modified_file in modified_files:
-                    modified_filename = os.path.basename(modified_file)
-                    if 'Имя файла' in existing_data.columns:
-                        file_mask = existing_data['Имя файла'] != modified_filename
-                        keep_mask = keep_mask & file_mask
-                    if 'Полный путь' in existing_data.columns:
-                        path_mask = existing_data['Полный путь'] != modified_file
-                        keep_mask = keep_mask & path_mask
+                if excel_manager:
+                    self.log_message("Сохранение в Excel...")
+                    excel_manager.write_excel_smart(
+                        final_new_data,
+                        key_columns=['Полный номер плавки', 'Отливка', 'Номер кассеты', 'Номер замера'],
+                        sheet_name='Sheet1',
+                        log_callback=self.log_message
+                    )
+                    final_df = excel_manager.read_excel_smart('Sheet1')[0]
+                else:
+                    final_df = final_new_data
+                    final_df.to_excel(result_path, index=False, engine='openpyxl')
                 
-                existing_data = existing_data[keep_mask].reset_index(drop=True)
-            
-            if not existing_data.empty and not new_data.empty:
-                final_data = pd.concat([existing_data, new_data], ignore_index=True, sort=False)
-            elif not existing_data.empty:
-                final_data = existing_data
+                self.log_message(f"Готово! Обработано новых: {processed_files_count}, пропущено: {skipped_files_count}")
+                return final_df
             else:
-                final_data = new_data
-            
-            if not final_data.empty:
-                final_data = final_data.drop_duplicates()
-                final_data = final_data.reset_index(drop=True)
-            
-            self.log_message(f"Готово! Обработано: {processed_files_count} файлов ({modified_files_count} измененных), пропущено: {skipped_files_count}")
-            return final_data
+                self.log_message(f"Новых данных не обнаружено. Пропущено: {skipped_files_count}")
+                if excel_manager:
+                    return excel_manager.read_excel_smart('Sheet1')[0]
+                return pd.DataFrame()
             
         except Exception as e:
-            self.log_message(f"Ошибка: {str(e)}")
+            self.log_message(f"Ошибка в process: {str(e)}")
             self.log_message(traceback.format_exc())
             return pd.DataFrame()
+
+def clear_cache_for_output(result_path):
+    if CacheManager:
+        cache = CacheManager("feather_turn", result_path)
+        cache.clear_cache()

@@ -3,6 +3,8 @@ import threading
 import os
 import json
 import pandas as pd
+import time
+import traceback
 from PyQt6.QtWidgets import (
     QApplication, QWidget, QLabel, QLineEdit, QPushButton,
     QFileDialog, QTextEdit, QVBoxLayout, QHBoxLayout,
@@ -10,8 +12,15 @@ from PyQt6.QtWidgets import (
 )
 from PyQt6.QtCore import Qt, pyqtSignal
 
+# Добавляем родительскую директорию в путь для импорта общих модулей
+sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+try:
+    from cache_manager import CacheManager
+except ImportError:
+    CacheManager = None
+
 # Import logic from the processor file
-from turn_processor import TurnProcessor
+from turn_processor import TurnProcessor, clear_cache_for_output
 
 # === UNIFIED THEME CONSTANTS ===
 THEME_STYLESHEET = """
@@ -78,6 +87,21 @@ THEME_STYLESHEET = """
     QPushButton#primary_btn:hover {
         background-color: #5dade2;
         border-color: #3498db;
+    }
+
+    /* Secondary Button (Clear Cache) */
+    QPushButton#secondary_btn {
+        background-color: #e67e22;
+        border-color: #d35400;
+    }
+    QPushButton#secondary_btn:hover {
+        background-color: #d35400;
+        border-color: #a04000;
+    }
+    QPushButton#secondary_btn:disabled {
+        background-color: #444444;
+        color: #888888;
+        border-color: #333333;
     }
     
     /* Logs */
@@ -172,7 +196,7 @@ class TurnApp(QWidget):
     def __init__(self):
         super().__init__()
         self.setWindowTitle("Feather Turn Processor")
-        self.resize(900, 600)
+        self.resize(900, 750)
         
         self.setWindowFlags(Qt.WindowType.FramelessWindowHint | Qt.WindowType.WindowSystemMenuHint)
         self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
@@ -213,9 +237,8 @@ class TurnApp(QWidget):
         self.grip.setFixedSize(20, 20)
         self.grip.setStyleSheet("background: transparent;")
         
-        self.grip.setStyleSheet("background: transparent;")
-        
         self.load_last_paths()
+        self.update_cache_button_state()
 
     def resizeEvent(self, event):
         if hasattr(self, 'grip'):
@@ -235,8 +258,7 @@ class TurnApp(QWidget):
         input_frame = QFrame()
         input_frame.setObjectName("input_frame")
         input_layout = QVBoxLayout(input_frame) 
-        
-        lbl_in = QLabel("📂 Папка с файлами измерений")
+        input_layout.addWidget(QLabel("📂 Папка с файлами измерений"))
         
         h_in = QHBoxLayout()
         self.source_path = QLineEdit()
@@ -244,13 +266,35 @@ class TurnApp(QWidget):
         self.btn_source = QPushButton("Обзор...")
         self.btn_source.setCursor(Qt.CursorShape.PointingHandCursor)
         self.btn_source.clicked.connect(self.select_source_folder)
-        
         h_in.addWidget(self.source_path)
         h_in.addWidget(self.btn_source)
-        
-        input_layout.addWidget(lbl_in)
         input_layout.addLayout(h_in)
         main_layout.addWidget(input_frame)
+
+        # === Output File ===
+        output_frame = QFrame()
+        output_frame.setObjectName("output_frame")
+        output_layout = QVBoxLayout(output_frame)
+        output_layout.addWidget(QLabel("📄 Файл результата (.xlsx)"))
+        
+        h_out = QHBoxLayout()
+        self.output_path = QLineEdit()
+        self.output_path.setPlaceholderText("Укажите, куда сохранить результат...")
+        self.output_path.textChanged.connect(self.update_cache_button_state)
+        self.btn_output = QPushButton("Выбрать...")
+        self.btn_output.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_output.clicked.connect(self.select_output_file)
+        h_out.addWidget(self.output_path)
+        h_out.addWidget(self.btn_output)
+        output_layout.addLayout(h_out)
+        
+        self.btn_clear_cache = QPushButton("🧹 Очистить кэш")
+        self.btn_clear_cache.setObjectName("secondary_btn")
+        self.btn_clear_cache.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_clear_cache.clicked.connect(self.clear_cache)
+        output_layout.addWidget(self.btn_clear_cache)
+        
+        main_layout.addWidget(output_frame)
 
         # === Progress Bar ===
         self.progress_bar = QProgressBar()
@@ -258,7 +302,7 @@ class TurnApp(QWidget):
         self.progress_bar.setValue(0)
         main_layout.addWidget(self.progress_bar)
 
-        # === Action Button ===
+        # === Action Buttons ===
         self.run_button = QPushButton("🚀 ЗАПУСТИТЬ")
         self.run_button.setObjectName("primary_btn")
         self.run_button.setCursor(Qt.CursorShape.PointingHandCursor)
@@ -276,7 +320,28 @@ class TurnApp(QWidget):
         folder = QFileDialog.getExistingDirectory(self, "Выберите директорию")
         if folder:
             self.source_path.setText(folder)
+            if not self.output_path.text():
+                self.output_path.setText(os.path.join(folder, 'consolidated_results.xlsx'))
             self.save_last_paths()
+
+    def select_output_file(self):
+        current_path = self.output_path.text().strip()
+        start_dir = current_path if current_path and os.path.exists(os.path.dirname(current_path)) else ""
+        
+        file_path, _ = QFileDialog.getSaveFileName(
+            self, "Сохранить отчет как...", start_dir,
+            "Excel Files (*.xlsx);;All Files (*)",
+            options=QFileDialog.Option.DontConfirmOverwrite
+        )
+        if file_path:
+            if not file_path.lower().endswith('.xlsx'):
+                file_path += '.xlsx'
+            self.output_path.setText(file_path)
+            self.save_last_paths()
+
+    def update_cache_button_state(self):
+        path = self.output_path.text().strip()
+        self.btn_clear_cache.setEnabled(bool(path))
             
     def load_last_paths(self):
         config_file = os.path.join(os.path.dirname(os.path.abspath(__file__)), "last_paths.json")
@@ -285,13 +350,15 @@ class TurnApp(QWidget):
                 with open(config_file, "r", encoding="utf-8") as f:
                     data = json.load(f)
                     self.source_path.setText(data.get("source", ""))
+                    self.output_path.setText(data.get("output", ""))
             except Exception:
                 pass
 
     def save_last_paths(self):
         config_file = os.path.join(os.path.dirname(os.path.abspath(__file__)), "last_paths.json")
         data = {
-            "source": self.source_path.text().strip()
+            "source": self.source_path.text().strip(),
+            "output": self.output_path.text().strip()
         }
         try:
             with open(config_file, "w", encoding="utf-8") as f:
@@ -299,24 +366,43 @@ class TurnApp(QWidget):
         except Exception:
             pass
 
+    def clear_cache(self):
+        result_path = self.output_path.text().strip()
+        if not result_path:
+             QMessageBox.warning(self, "Ошибка", "Выберите файл результата!")
+             return
+             
+        reply = QMessageBox.question(self, 'Очистка кэша', 
+                                   f"Вы уверены, что хотите очистить кэш для этого файла?\nЭто приведет к полной перечитке всех данных при следующем запуске.",
+                                   QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No, 
+                                   QMessageBox.StandardButton.No)
+        
+        if reply == QMessageBox.StandardButton.Yes:
+            clear_cache_for_output(result_path)
+            self.log_text.append(f"[{time.strftime('%H:%M:%S')}] Кэш очищен.")
+            QMessageBox.information(self, "Готово", "Кэш успешно очищен.")
+
     def start_processing(self):
         source = self.source_path.text().strip()
+        output = self.output_path.text().strip()
         
-        if not source:
-            QMessageBox.warning(self, "Ошибка", "Выберите директорию!")
+        if not source or not output:
+            QMessageBox.warning(self, "Ошибка", "Выберите директорию и файл результата!")
             return
 
         self.run_button.setEnabled(False)
+        self.btn_clear_cache.setEnabled(False)
         self.run_button.setText("⏳ Идёт обработка...")
         self.log_text.clear()
         self.progress_bar.setValue(0)
         
-        thread = threading.Thread(target=self.run_processing, args=(source,))
+        thread = threading.Thread(target=self.run_processing, args=(source, output))
         thread.start()
 
-    def run_processing(self, source):
+    def run_processing(self, source, output):
         processor = TurnProcessor(
             directory=source, 
+            output_file=output,
             log_callback=self.log_callback,
             progress_callback=self.update_progress
         )
@@ -325,6 +411,7 @@ class TurnApp(QWidget):
             self.finished_signal.emit(final_df)
         except Exception as e:
             self.log_signal.emit(f"Критическая ошибка: {e}")
+            traceback.print_exc()
             self.finished_signal.emit(None)
 
     def log_callback(self, message):
@@ -335,17 +422,12 @@ class TurnApp(QWidget):
 
     def on_processing_finished(self, result_df):
         self.run_button.setEnabled(True)
+        self.update_cache_button_state()
         self.run_button.setText("🚀 ЗАПУСТИТЬ")
         
         if result_df is not None and not result_df.empty:
-            result_path = os.path.join(self.source_path.text(), 'consolidated_results.xlsx')
-            try:
-                result_df.to_excel(result_path, index=False, engine='openpyxl')
-                self.log_text.append(f"\n✅ Результаты успешно сохранены в:\n{result_path}")
-                QMessageBox.information(self, "Готово", f"Обработка завершена!\nСохранено записей: {len(result_df)}")
-            except Exception as e:
-                 self.log_text.append(f"\n❌ Ошибка при сохранении: {e}")
-                 QMessageBox.critical(self, "Ошибка", f"Не удалось сохранить файл: {e}")
+            self.log_text.append(f"\n✅ Обработка завершена. Всего записей: {len(result_df)}")
+            QMessageBox.information(self, "Готово", f"Обработка завершена!\nВсего записей: {len(result_df)}")
 
 if __name__ == "__main__":
     app = QApplication(sys.argv)

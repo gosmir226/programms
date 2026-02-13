@@ -1,105 +1,123 @@
 import os
+import sys
 from nptdms import TdmsFile
 import pandas as pd
 import re
 import report_builder as rb
 import core_algorithms as ca
-import json
 import logging
 from datetime import datetime
+from openpyxl import load_workbook
 from openpyxl.worksheet.table import Table, TableStyleInfo
 from openpyxl.utils import get_column_letter
+
+# Добавляем родительскую директорию в путь для импорта общих модулей
+sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+try:
+    from excel_manager import ExcelManager
+    from cache_manager import CacheManager
+except ImportError:
+    ExcelManager = None
+    CacheManager = None
 
 logging.getLogger("nptdms.reader").setLevel(logging.ERROR)
 
 FILENAME_PATTERN = re.compile(r'^\d+\.tdms$')
-BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-CACHE_FILE = os.path.join(BASE_DIR, "cache.json")
-
-def load_cache():
-    """Загружает кэш из файла или возвращает пустой словарь"""
-    if os.path.exists(CACHE_FILE):
-        try:
-            with open(CACHE_FILE, "r", encoding="utf-8") as f:
-                return json.load(f)
-        except (json.JSONDecodeError, FileNotFoundError):
-            print(f"[КЭШ] Файл {CACHE_FILE} повреждён или пуст. Создаётся новый.")
-    return {}
-
-def save_cache(cache):
-    """Сохраняет кэш в файл"""
-    try:
-        with open(CACHE_FILE, "w", encoding="utf-8") as f:
-            json.dump(cache, f, indent=2, ensure_ascii=False)
-    except Exception as e:
-        print(f"[КЭШ] Ошибка при сохранении кэша: {e}")
 
 def deduplicate_columns(df):
     """
-    Renames duplicate columns (or empty ones) to ensure every column has a unique string name.
-    Useful for creating Excel Tables which require unique non-empty headers.
+    Переименовывает дублирующиеся столбцы, добавляя суффиксы.
+    Это КРИТИЧНО для создания Excel Table, которая требует уникальных заголовков.
     """
-    new_columns = []
-    seen = set()
-    for col in df.columns:
-        col_str = str(col).strip()
-        if not col_str:
-            col_str = "Unnamed"
-        
-        if col_str in seen:
-            i = 1
-            while f"{col_str}_{i}" in seen:
-                i += 1
-            col_str = f"{col_str}_{i}"
-        
-        seen.add(col_str)
-        new_columns.append(col_str)
-    
-    df.columns = new_columns
+    cols = list(df.columns)
+    seen = {}
+    new_cols = []
+    for col in cols:
+        if col in seen:
+            seen[col] += 1
+            new_name = f"{col}_{seen[col]}"
+            new_cols.append(new_name)
+        else:
+            seen[col] = 0
+            new_cols.append(col)
+    df.columns = new_cols
     return df
 
-def read_tdms_file(path):
+def read_tdms_file(file_path):
+    """Читает .tdms файл и возвращает DataFrame. При ошибке возвращает None."""
     try:
-        tdms_file = TdmsFile.read(path)
-        data = {}
-        for group in tdms_file.groups():
-            for channel in group.channels():
-                data[channel.name] = channel[:]
-        
-        # Try creating DataFrame directly (fastest, requires equal lengths)
-        try:
-            return pd.DataFrame(data)
-        except ValueError:
-            # Fallback: create using Series to support channels of different lengths
-            return pd.DataFrame({k: pd.Series(v) for k, v in data.items()})
-            
+        tdms_file = TdmsFile.read(file_path)
+        all_groups = tdms_file.groups()
+        if not all_groups:
+            return None
+
+        dataframes = []
+        for group in all_groups:
+            channels = group.channels()
+            if not channels:
+                continue
+
+            data_dict = {}
+            for ch in channels:
+                arr = ch[:]
+                data_dict[ch.name] = arr
+            df_group = pd.DataFrame(data_dict)
+            dataframes.append(df_group)
+
+        if dataframes:
+            merged = pd.concat(dataframes, axis=1) if len(dataframes) > 1 else dataframes[0]
+            return merged
+        else:
+            return None
+
     except Exception as e:
-        print(f"Ошибка при чтении файла {path}: {e}")
+        print(f"Ошибка чтения файла {file_path}: {e}")
         return None
 
-def merge_dataframes(df1, df2):
-    if df2.empty:
-        raise ValueError("❌ Второй DataFrame пустой.")
+def merge_dataframes(df_reports, df_pasport):
+    """
+    Объединяет данные из Reports и Pasport.
+    Предполагается, что у них одинаковое количество строк и есть столбец 'NumberOfM'.
+    """
+    if 'NumberOfM' not in df_pasport.columns:
+        raise ValueError("Столбец 'NumberOfM' не найден в Pasport")
 
-    first_row_df2 = df2.iloc[0].to_dict()
+    if len(df_reports) == 0 or len(df_pasport) == 0:
+        raise ValueError("Один из DataFrame пуст")
 
-    repeated_values = {col: [first_row_df2[col]] * len(df1) for col in df2.columns}
+    number_of_m = df_pasport['NumberOfM'].iloc[0]
+    df_reports_copy = df_reports.copy()
+    df_reports_copy['NumberOfM'] = number_of_m
 
-    df2_repeated = pd.DataFrame(repeated_values)
+    pasport_cols = [c for c in df_pasport.columns if c not in df_reports_copy.columns]
+    for col in pasport_cols:
+        df_reports_copy[col] = df_pasport[col].iloc[0]
 
-    merged_df = pd.concat([df1.reset_index(drop=True), df2_repeated.reset_index(drop=True)], axis=1)
-
-    return merged_df
+    return df_reports_copy
 
 def process_session_to_excel(root_folder, output_excel_path, log_callback):
     """
     Сканирует корневую папку на наличие подпапок (установок).
     В каждой подпапке ищет Pasport/Reports, обрабатывает их и собирает общую таблицу.
+    Использует CacheManager для отслеживания изменений и ExcelManager для надежного обновления Excel.
     """
     if not os.path.exists(root_folder):
         log_callback(f"Ошибка: Корневая папка не существует: {root_folder}")
         return
 
+    # Инициализируем кэш и Excel manager
+    if CacheManager:
+        cache = CacheManager('UVNK', output_excel_path)
+    else:
+        cache = None
+        log_callback("ВНИМАНИЕ: CacheManager не загружен")
+        
+    if ExcelManager:
+        excel_manager = ExcelManager(output_excel_path)
+    else:
+        excel_manager = None
+        log_callback("ВНИМАНИЕ: ExcelManager не загружен")
+    
     # Ищем все подпапки в корневой директории
     subfolders = [
         f for f in os.listdir(root_folder)
@@ -112,20 +130,50 @@ def process_session_to_excel(root_folder, output_excel_path, log_callback):
 
     FILENAME_PATTERN = re.compile(r'^(\d+)\.tdms$')
     
-    # Загружаем кэш (он один на весь выходной файл)
-    cache = load_cache()
-    output_excel_key = os.path.abspath(output_excel_path)
-    processed_files_set = set(cache.get(output_excel_key, []))
+    # Собираем список всех tdms файлов
+    all_tdms_files = []
+    for installation_name in subfolders:
+        installation_folder = os.path.join(root_folder, installation_name)
+        reports_folder = os.path.join(installation_folder, "Reports")
+        
+        if os.path.isdir(reports_folder):
+            for filename in os.listdir(reports_folder):
+                if FILENAME_PATTERN.match(filename):
+                    file_path = os.path.join(reports_folder, filename)
+                    all_tdms_files.append((file_path, installation_name, filename))
+    
+    # Определяем, какие файлы нужно перечитать
+    if cache:
+        stale_file_paths = []
+        for f_path, _, _ in all_tdms_files:
+            if cache.is_file_changed(f_path):
+                stale_file_paths.append(os.path.abspath(f_path))
+    else:
+        stale_file_paths = [os.path.abspath(f[0]) for f in all_tdms_files]
+    
+    # Собираем источники (Установки), которые требуют обновления
+    modified_installations = set()
+    for file_path, installation_name, filename in all_tdms_files:
+        if os.path.abspath(file_path) in stale_file_paths:
+            modified_installations.add(installation_name)
+    
+    if not modified_installations:
+        log_callback("Все файлы уже обработаны и не изменились. Обработка не требуется.")
+        return
 
     all_result_rows = []
-    newly_processed_files_batch = []
-    execution_logs = []  # Список для логов выполнения
-    
+    execution_logs = []
     total_new_rows_count = 0
 
     log_callback(f"Найдено установок (папок): {len(subfolders)}")
+    log_callback(f"Установок требующих обновления: {len(modified_installations)}")
 
     for installation_name in subfolders:
+        # Обрабатываем только установки с измененными файлами
+        if installation_name not in modified_installations:
+            log_callback(f"\n--- Установка {installation_name}: все файлы актуальны, пропуск ---")
+            continue
+            
         installation_folder = os.path.join(root_folder, installation_name)
         log_callback(f"\n--- Обработка установки: {installation_name} ---")
 
@@ -144,273 +192,135 @@ def process_session_to_excel(root_folder, output_excel_path, log_callback):
             continue
 
         def get_valid_files(folder):
-            return [
-                f for f in os.listdir(folder)
-                if FILENAME_PATTERN.match(f)
-            ]
+            return [f for f in os.listdir(folder) if FILENAME_PATTERN.match(f)]
 
         pasport_files = set(get_valid_files(pasport_folder))
         reports_files = set(get_valid_files(reports_folder))
         
-        # Файлы, которые есть в Reports, но нет в Pasport
-        missing_in_pasport = reports_files - pasport_files
-        for missing_file in missing_in_pasport:
-            execution_logs.append({
-                'Дата': datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-                'Установка': installation_name,
-                'Файл': missing_file,
-                'Статус': 'Пропущено',
-                'Причина': 'Отсутствует файл в папке Pasport'
-            })
-            
-        # Файлы, которые есть в Pasport, но нет в Reports
-        missing_in_reports = pasport_files - reports_files
-        for missing_file in missing_in_reports:
-             execution_logs.append({
-                'Дата': datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-                'Установка': installation_name,
-                'Файл': missing_file,
-                'Статус': 'Пропущено',
-                'Причина': 'Отсутствует файл в папке Reports'
-            })
-
-        def get_mod_time(filename):
-            path = os.path.join(reports_folder, filename)
-            if os.path.exists(path):
-                return os.path.getmtime(path)
-            return 0
-
-        common_files = sorted(list(pasport_files & reports_files), key=get_mod_time)
+        common_files = sorted(list(pasport_files & reports_files), key=lambda x: os.path.getmtime(os.path.join(reports_folder, x)))
 
         if not common_files:
             log_callback(f"В {installation_name} нет общих файлов.")
             continue
 
-        # Локальное состояние натекания для этой установки
         current_leakage_info = None
         
         for filename in common_files:
-            # Ключ для кэша теперь включает имя установки: UVNK1/123.tdms
-            cache_key = f"{installation_name}/{filename}"
-            is_new = cache_key not in processed_files_set
-
             pasport_path = os.path.join(pasport_folder, filename)
             reports_path = os.path.join(reports_folder, filename)
-
-            df_reports = read_tdms_file(reports_path)
-            if df_reports is None or df_reports.empty:
-                log_callback(f"[{installation_name}] Файл {filename}: Reports не прочитан или пуст. Пропуск.")
+            abs_reports_path = os.path.abspath(reports_path)
+            
+            # Проверяем кэш
+            if cache and not cache.is_file_changed(abs_reports_path):
+                # Но нам нужно натекание!
+                df_reports = read_tdms_file(reports_path)
+                if df_reports is not None and not df_reports.empty:
+                    df_pasport = read_tdms_file(pasport_path)
+                    merged_df = None
+                    if df_pasport is not None and not df_pasport.empty:
+                        try: merged_df = merge_dataframes(df_reports, df_pasport)
+                        except: merged_df = None
+                    if merged_df is None:
+                        merged_df = df_reports.copy()
+                        merged_df['NumberOfM'] = os.path.splitext(filename)[0]
+                    
+                    leakage = ca.get_last_valid_leakage(merged_df)
+                    if leakage:
+                        current_leakage_info = leakage
+                        current_leakage_info['source'] = filename
+                
                 execution_logs.append({
                     'Дата': datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
                     'Установка': installation_name,
                     'Файл': filename,
-                    'Статус': 'Ошибка',
-                    'Причина': 'Reports не прочитан или пуст'
+                    'Статус': 'Пропущено',
+                    'Причина': 'Уже в кэше'
                 })
+                continue
+
+            # Обработка нового/измененного файла
+            df_reports = read_tdms_file(reports_path)
+            if df_reports is None or df_reports.empty:
                 continue
 
             df_pasport = read_tdms_file(pasport_path)
             merged_df = None
-            
-            # Пытаемся объединить, если паспорт прочитался
             if df_pasport is not None and not df_pasport.empty:
-                try:
-                    merged_df = merge_dataframes(df_reports, df_pasport)
-                except Exception as e:
-                    log_callback(f"[{installation_name}] {filename}: Ошибка объединения с паспортом ({e}). Обрабатываем только Reports.")
-                    merged_df = None
-            else:
-                log_callback(f"[{installation_name}] {filename}: Паспорт пуст или не прочитан. Обрабатываем только Reports.")
-
-            # Если объединение не удалось — работаем только с Reports
+                try: merged_df = merge_dataframes(df_reports, df_pasport)
+                except: merged_df = None
+            
             if merged_df is None:
                 merged_df = df_reports.copy()
-                # Добавляем имя файла как NumberOfM (без расширения)
-                file_name_no_ext = os.path.splitext(filename)[0]
-                merged_df['NumberOfM'] = file_name_no_ext
+                merged_df['NumberOfM'] = os.path.splitext(filename)[0]
 
-            # Далее обработка (общая для обоих случаев)
             try:
-                # Обновляем инфо о натекании из текущего файла
                 leakage = ca.get_last_valid_leakage(merged_df)
                 if leakage:
                     current_leakage_info = leakage
                     current_leakage_info['source'] = filename
-                    log_callback(f"[{installation_name}] {filename}: найдено новое натекание (source={filename}).")
 
-                if is_new:
-                    # Перед обработкой нужно убедиться, что имена столбцов уникальны, чтобы не было конфликтов
-                    merged_df = deduplicate_columns(merged_df)
-                    
-                    rows = rb.process_dataframe_segments(merged_df, current_leakage_info)
-                    if rows:
-                        # Добавляем столбец Установка
-                        for row in rows:
-                            row['Установка'] = installation_name
-                        
-                        all_result_rows.extend(rows)
-                        total_new_rows_count += len(rows)
-                        log_callback(f"[{installation_name}] {filename}: обработано {len(rows)} сегментов.")
-                        execution_logs.append({
-                            'Дата': datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-                            'Установка': installation_name,
-                            'Файл': filename,
-                            'Статус': 'Успешно',
-                            'Причина': f'Обработано {len(rows)} сегментов'
-                        })
-                    else:
-                        log_callback(f"[{installation_name}] {filename}: не найдено валидных сегментов.")
-                        execution_logs.append({
-                            'Дата': datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-                            'Установка': installation_name,
-                            'Файл': filename,
-                            'Статус': 'Пропущено',
-                            'Причина': 'Не найдено валидных сегментов'
-                        })
-                    
-                    newly_processed_files_batch.append(cache_key)
+                merged_df = deduplicate_columns(merged_df)
+                rows = rb.process_dataframe_segments(merged_df, current_leakage_info)
+                if rows:
+                    for row in rows: row['Установка'] = installation_name
+                    all_result_rows.extend(rows)
+                    total_new_rows_count += len(rows)
+                    if cache: cache.update_file(abs_reports_path)
+                    execution_logs.append({
+                        'Дата': datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                        'Установка': installation_name,
+                        'Файл': filename,
+                        'Статус': 'Успешно',
+                        'Причина': f'Обработано {len(rows)} сегментов'
+                    })
                 else:
-                    # Файл уже был обработан
+                    if cache: cache.update_file(abs_reports_path)
                     execution_logs.append({
                         'Дата': datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
                         'Установка': installation_name,
                         'Файл': filename,
                         'Статус': 'Пропущено',
-                        'Причина': 'Уже обработан ранее (в кэше)'
+                        'Причина': 'Нет валидных сегментов'
                     })
-                    pass
-
             except Exception as e:
-                log_callback(f"Ошибка при обработке {installation_name}/{filename}: {e}")
-                execution_logs.append({
-                    'Дата': datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-                    'Установка': installation_name,
-                    'Файл': filename,
-                    'Статус': 'Ошибка',
-                    'Причина': f'Исключение: {str(e)}'
-                })
+                log_callback(f"Ошибка {installation_name}/{filename}: {e}")
 
     # Сохранение результатов
     if all_result_rows or execution_logs:
-        result_df = pd.DataFrame(all_result_rows) 
-        logs_df = pd.DataFrame(execution_logs)
-
-        # Вывод result_df - Упорядочиваем столбцы - Установка первая
-        if not result_df.empty:
-            cols = ['Установка'] + [c for c in result_df.columns if c != 'Установка']
-            result_df = result_df[cols]
-
-        combined_data_df = pd.DataFrame()
-        combined_logs_df = pd.DataFrame()
-
-        if os.path.exists(output_excel_path):
-            try:
-                # Читаем все листы
-                xls = pd.ExcelFile(output_excel_path)
+        if excel_manager:
+            result_df = pd.DataFrame(all_result_rows)
+            if not result_df.empty:
+                # Установка первая
+                cols = ['Установка'] + [c for c in result_df.columns if c != 'Установка']
+                result_df = result_df[cols]
+                result_df = deduplicate_columns(result_df)
                 
-                # Sheet с данными (обычно первый или 'Data')
-                sheet_names = xls.sheet_names
-                data_sheet = 'Data' if 'Data' in sheet_names else sheet_names[0]
-                logs_sheet = 'Logs' if 'Logs' in sheet_names else None
-                
-                existing_data = pd.read_excel(output_excel_path, sheet_name=data_sheet)
-                
-                if not result_df.empty:
-                    combined_data_df = pd.concat([existing_data, result_df], ignore_index=True)
-                else:
-                    combined_data_df = existing_data
-                
-                if logs_sheet:
-                    existing_logs = pd.read_excel(output_excel_path, sheet_name=logs_sheet)
-                    combined_logs_df = pd.concat([existing_logs, logs_df], ignore_index=True)
-                else:
-                    combined_logs_df = logs_df
-
-            except Exception as e:
-                log_callback(f"Ошибка при чтении существующего файла Excel: {e}")
-                return
+                excel_manager.write_excel_smart(
+                    result_df, 
+                    key_columns=['Установка', 'NumberOfM'], # Уникально идентифицирует замер в рамках установки
+                    sheet_name='Data',
+                    log_callback=log_callback
+                )
+            
+            logs_df = pd.DataFrame(execution_logs)
+            if not logs_df.empty:
+                logs_df = deduplicate_columns(logs_df)
+                excel_manager.write_excel_smart(
+                    logs_df,
+                    key_columns=['Дата', 'Установка', 'Файл'],
+                    sheet_name='Logs',
+                    log_callback=log_callback,
+                    mode='append' # Логи всегда добавляем
+                )
         else:
-            combined_data_df = result_df
-            combined_logs_df = logs_df
-            
-        # -- ВАЖНО: Дедупликация колонок перед записью, иначе Excel-таблица сломается --
-        if not combined_data_df.empty:
-            combined_data_df = deduplicate_columns(combined_data_df)
-        if not combined_logs_df.empty:
-            combined_logs_df = deduplicate_columns(combined_logs_df)
+            # Fallback
+            pd.DataFrame(all_result_rows).to_excel(output_excel_path, index=False)
 
-        try:
-            with pd.ExcelWriter(output_excel_path, engine='openpyxl') as writer:
-                combined_data_df.to_excel(writer, sheet_name='Data', index=False)
-                combined_logs_df.to_excel(writer, sheet_name='Logs', index=False)
-                
-                # Форматирование как "Умная таблица" (Excel Table)
-                # Требует уникальных заголовков (обеспечено deduplicate_columns)
-                workbook = writer.book
-                
-                # --- Лист Data ---
-                if not combined_data_df.empty:
-                    ws_data = writer.sheets['Data']
-                    last_row = len(combined_data_df) + 1  # +1 для заголовка
-                    last_col = len(combined_data_df.columns)
-                    if last_row >= 2 and last_col >= 1: # Таблица должна иметь хотя бы 1 строку данных
-                        ref = f"A1:{get_column_letter(last_col)}{last_row}"
-                        tab = Table(displayName="Table_Data", ref=ref)
-                        style = TableStyleInfo(name="TableStyleMedium2", showFirstColumn=False,
-                                               showLastColumn=False, showRowStripes=True, showColumnStripes=False)
-                        tab.tableStyleInfo = style
-                        ws_data.add_table(tab)
-                        
-                        # Автоширина колонок (примерно)
-                        for column in ws_data.columns:
-                            max_length = 0
-                            column_letter = get_column_letter(column[0].column)
-                            for cell in column:
-                                try:
-                                    if len(str(cell.value)) > max_length:
-                                        max_length = len(str(cell.value))
-                                except:
-                                    pass
-                            adjusted_width = (max_length + 2)
-                            ws_data.column_dimensions[column_letter].width = min(adjusted_width, 50) 
-
-                # --- Лист Logs ---
-                if not combined_logs_df.empty:
-                    ws_logs = writer.sheets['Logs']
-                    last_row = len(combined_logs_df) + 1 # +1 для заголовка
-                    last_col = len(combined_logs_df.columns)
-                    if last_row >= 2 and last_col >= 1:
-                        ref = f"A1:{get_column_letter(last_col)}{last_row}"
-                        tab = Table(displayName="Table_Logs", ref=ref)
-                        style = TableStyleInfo(name="TableStyleMedium2", showFirstColumn=False,
-                                               showLastColumn=False, showRowStripes=True, showColumnStripes=False)
-                        tab.tableStyleInfo = style
-                        ws_logs.add_table(tab)
-                         
-                         # Автоширина колонок
-                        for column in ws_logs.columns:
-                            max_length = 0
-                            column_letter = get_column_letter(column[0].column)
-                            for cell in column:
-                                try:
-                                    if len(str(cell.value)) > max_length:
-                                        max_length = len(str(cell.value))
-                                except:
-                                    pass
-                            adjusted_width = (max_length + 2)
-                            ws_logs.column_dimensions[column_letter].width = min(adjusted_width, 70)
-
-            log_callback(f"Всего добавлено {total_new_rows_count} строк данных. Файл сохранён: {output_excel_path}")
-            
-            if newly_processed_files_batch:    
-                # Обновляем кэш
-                updated_cache_list = list(processed_files_set.union(newly_processed_files_batch))
-                cache[output_excel_key] = updated_cache_list
-                save_cache(cache)
-                log_callback("Кэш обновлён.")
-                
-        except Exception as e:
-            log_callback(f"Ошибка при сохранении файла: {e}")
-    
+        log_callback(f"Обработка завершена. Добавлено {total_new_rows_count} строк.")
     else:
-        log_callback("Нет новых данных и логов для сохранения.")
+        log_callback("Нет новых данных для сохранения.")
+
+def clear_cache_for_output(output_excel_path):
+    if CacheManager:
+        cache = CacheManager('UVNK', output_excel_path)
+        cache.clear_cache()

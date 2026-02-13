@@ -7,13 +7,19 @@ import traceback
 from PyQt6.QtWidgets import (
     QApplication, QWidget, QLabel, QLineEdit, QPushButton,
     QFileDialog, QTextEdit, QVBoxLayout, QHBoxLayout,
-    QFrame, QMessageBox, QProgressBar
+    QFrame, QMessageBox, QProgressBar, QSizeGrip
 )
 from PyQt6.QtCore import Qt, pyqtSignal
-from PyQt6.QtWidgets import QSizeGrip
+
+# Добавляем родительскую директорию в путь для импорта общих модулей
+sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+try:
+    from cache_manager import CacheManager
+except ImportError:
+    CacheManager = None
 
 # Import logic from the processor file
-from green_table_processor import GreenTableProcessor
+from green_table_processor import GreenTableProcessor, clear_cache_for_output
 
 # === UNIFIED THEME CONSTANTS ===
 THEME_STYLESHEET = """
@@ -38,7 +44,7 @@ THEME_STYLESHEET = """
     }
     QLabel#header_label {
         font-size: 18px;
-        color: #27ae60; /* Green tint for Green Table */
+        color: #2ecc71;
         font-weight: bold;
     }
     
@@ -52,7 +58,7 @@ THEME_STYLESHEET = """
         font-size: 13px;
     }
     QLineEdit:focus {
-        border-color: #27ae60;
+        border-color: #2ecc71;
     }
     
     /* Buttons */
@@ -74,12 +80,27 @@ THEME_STYLESHEET = """
     
     /* Primary Action Button */
     QPushButton#primary_btn {
-        background-color: #27ae60;
-        border-color: #219150;
-    }
-    QPushButton#primary_btn:hover {
         background-color: #2ecc71;
         border-color: #27ae60;
+    }
+    QPushButton#primary_btn:hover {
+        background-color: #27ae60;
+        border-color: #2ecc71;
+    }
+
+    /* Secondary Button (Clear Cache) */
+    QPushButton#secondary_btn {
+        background-color: #e67e22;
+        border-color: #d35400;
+    }
+    QPushButton#secondary_btn:hover {
+        background-color: #d35400;
+        border-color: #a04000;
+    }
+    QPushButton#secondary_btn:disabled {
+        background-color: #444444;
+        color: #888888;
+        border-color: #333333;
     }
     
     /* Logs */
@@ -101,7 +122,7 @@ THEME_STYLESHEET = """
         background-color: #1e1e1e;
     }
     QProgressBar::chunk {
-        background-color: #27ae60;
+        background-color: #2ecc71;
     }
 """
 
@@ -124,7 +145,7 @@ class CustomTitleBar(QFrame):
         layout.setSpacing(0)
         
         # Icon/Title
-        self.title_label = QLabel("Сбор данных в зеленую таблицу")
+        self.title_label = QLabel(self.window_parent.windowTitle())
         layout.addWidget(self.title_label)
         layout.addStretch()
         
@@ -146,7 +167,6 @@ class CustomTitleBar(QFrame):
         layout.addWidget(self.btn_max)
         layout.addWidget(self.btn_close)
         
-        # Dragging variables
         self.click_pos = None
 
     def toggle_max(self):
@@ -290,13 +310,23 @@ class GreenTableApp(QWidget):
         self.progress_bar.setValue(0)
         main_layout.addWidget(self.progress_bar)
 
-        # === Action Button ===
+        # === Action Buttons ===
+        btns_layout = QHBoxLayout()
+        
         self.run_button = QPushButton("🚀 НАЧАТЬ СБОР ДАННЫХ")
         self.run_button.setObjectName("primary_btn")
         self.run_button.setCursor(Qt.CursorShape.PointingHandCursor)
         self.run_button.setMinimumHeight(50)
         self.run_button.clicked.connect(self.start_processing)
-        main_layout.addWidget(self.run_button)
+        
+        self.clear_cache_button = QPushButton("🧹 Очистить кэш")
+        self.clear_cache_button.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.clear_cache_button.setMinimumHeight(50)
+        self.clear_cache_button.clicked.connect(self.clear_cache)
+        
+        btns_layout.addWidget(self.run_button, 4)
+        btns_layout.addWidget(self.clear_cache_button, 1)
+        main_layout.addLayout(btns_layout)
 
         # === Logs ===
         main_layout.addWidget(QLabel("Журнал событий:"))
@@ -311,7 +341,9 @@ class GreenTableApp(QWidget):
             self.save_last_paths()
 
     def select_output_file(self):
-        file, _ = QFileDialog.getSaveFileName(self, "Сохранить файл", "", "Excel Files (*.xlsx)")
+        # Используем Variant 1: DontConfirmOverwrite
+        options = QFileDialog.Option.DontConfirmOverwrite
+        file, _ = QFileDialog.getSaveFileName(self, "Сохранить файл", self.output_path.text(), "Excel Files (*.xlsx)", options=options)
         if file:
             self.output_path.setText(file)
             self.save_last_paths()
@@ -339,6 +371,22 @@ class GreenTableApp(QWidget):
         except Exception:
             pass
 
+    def clear_cache(self):
+        output = self.output_path.text().strip()
+        if not output:
+             QMessageBox.warning(self, "Ошибка", "Укажите выходной файл для определения кэша!")
+             return
+        
+        reply = QMessageBox.question(self, 'Очистка кэша', 
+                                   f"Вы уверены, что хотите очистить кэш для файла {os.path.basename(output)}?\nЭто приведет к полной перечитке всех данных при следующем запуске.",
+                                   QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No, 
+                                   QMessageBox.StandardButton.No)
+        
+        if reply == QMessageBox.StandardButton.Yes:
+            clear_cache_for_output(output)
+            self.log_text.append(f"[{time.strftime('%H:%M:%S')}] Кэш очищен.")
+            QMessageBox.information(self, "Готово", "Кэш успешно очищен.")
+
     def start_processing(self):
         source = self.source_path.text().strip()
         output = self.output_path.text().strip()
@@ -351,6 +399,7 @@ class GreenTableApp(QWidget):
             return
 
         self.run_button.setEnabled(False)
+        self.clear_cache_button.setEnabled(False)
         self.run_button.setText("⏳ Идёт обработка...")
         self.log_text.clear()
         self.progress_bar.setValue(0)
@@ -364,6 +413,7 @@ class GreenTableApp(QWidget):
             processor.process_directory(source, output, update_progress=self.update_progress)
         except Exception as e:
             self.log_signal.emit(f"Критическая ошибка: {e}")
+            traceback.print_exc()
         finally:
             self.finished_signal.emit()
 
@@ -375,6 +425,7 @@ class GreenTableApp(QWidget):
 
     def on_processing_finished(self):
         self.run_button.setEnabled(True)
+        self.clear_cache_button.setEnabled(True)
         self.run_button.setText("🚀 НАЧАТЬ СБОР ДАННЫХ")
 
 if __name__ == "__main__":

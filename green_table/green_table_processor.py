@@ -6,6 +6,16 @@ import pandas as pd
 from openpyxl import load_workbook
 import traceback
 from datetime import datetime
+import sys
+
+# Добавляем родительскую директорию в путь для импорта общих модулей
+sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+try:
+    from excel_manager import ExcelManager
+    from cache_manager import CacheManager
+except ImportError:
+    ExcelManager = None
+    CacheManager = None
 
 class GreenTableProcessor:
     def __init__(self, log_callback=None):
@@ -641,19 +651,40 @@ class GreenTableProcessor:
             excel_files = glob.glob(os.path.join(directory, "**", "*.xlsx"), recursive=True)
             excel_files.extend(glob.glob(os.path.join(directory, "**", "*.xls"), recursive=True))
             
+            # Исключаем сам выходной файл
+            excel_files = [f for f in excel_files if os.path.abspath(f) != os.path.abspath(output_file)]
+            
             if not excel_files:
                 self.log_message("Excel файлы не найдены")
                 return
             
             self.log_message(f"Найдено {len(excel_files)} Excel файлов")
             
+            # Инициализируем менеджеры
+            if CacheManager:
+                cache = CacheManager("green_table", output_file)
+            else:
+                cache = None
+                
+            if ExcelManager:
+                excel_manager = ExcelManager(output_file)
+            else:
+                excel_manager = None
+            
             all_data = []
-            processed_files = 0
+            processed_files_count = 0
             
             for file_idx, input_file in enumerate(excel_files):
                 if update_progress:
                      update_progress(int((file_idx) / len(excel_files) * 100))
                 
+                abs_input_path = os.path.abspath(input_file)
+                
+                # Проверяем кэш
+                if cache and not cache.is_file_changed(abs_input_path):
+                    self.log_message(f"[{file_idx+1}/{len(excel_files)}] Пропуск (в кэше): {os.path.basename(input_file)}")
+                    continue
+
                 try:
                     file_name = os.path.basename(input_file)
                     self.log_message(f"[{file_idx+1}/{len(excel_files)}] Обработка: {file_name}")
@@ -666,7 +697,12 @@ class GreenTableProcessor:
                     
                     all_data.extend(file_data)
                     workbook.close()
-                    processed_files += 1
+                    processed_files_count += 1
+                    
+                    # Обновляем кэш
+                    if cache:
+                        cache.update_file(abs_input_path)
+                        
                 except Exception as e:
                     self.log_message(f"Ошибка с файлом {input_file}: {e}")
                     self.error_log.append({'Файл': input_file, 'Ошибка': str(e)})
@@ -675,33 +711,59 @@ class GreenTableProcessor:
             
             if all_data:
                 self.log_message("Формирование итоговой таблицы...")
-                with pd.ExcelWriter(output_file, engine='openpyxl') as writer:
-                    df = pd.DataFrame(all_data)
-                    base_columns = ['Дата', 'Печь', 'Керамика', 'Железо', 'Плавка', 'ТУ',
-                                'Металл', 'Шихта', 'Блок 1', 'Блок 2', 
-                                'Комплект оснастки', 'Образцы', 'Номенклатура']
-                    extra_columns = ['Номер заливки после переборки', 'Порядок заливки в плавке']
-                    cols = base_columns + extra_columns + ['Комментарий']
+                df = pd.DataFrame(all_data)
+                
+                base_columns = ['Дата', 'Печь', 'Керамика', 'Железо', 'Плавка', 'ТУ',
+                            'Металл', 'Шихта', 'Блок 1', 'Блок 2', 
+                            'Комплект оснастки', 'Образцы', 'Номенклатура']
+                extra_columns = ['Номер заливки после переборки', 'Порядок заливки в плавке']
+                all_cols = base_columns + extra_columns + ['Комментарий']
+                
+                # Гарантируем наличие всех колонок
+                for col in all_cols:
+                    if col not in df.columns: df[col] = None
+                
+                # Упорядочиваем
+                df = df[all_cols]
+                
+                if excel_manager:
+                    # Используем умное сохранение
+                    success = excel_manager.write_excel_smart(
+                        df,
+                        key_columns=['Дата', 'Печь', 'Плавка', 'Блок 1'],
+                        sheet_name='Данные',
+                        log_callback=self.log_message
+                    )
                     
-                    for col in cols:
-                        if col not in df.columns: df[col] = None
-                    
-                    df[cols].to_excel(writer, sheet_name='Данные', index=False)
-                    
-                    if self.error_log:
-                        pd.DataFrame(self.error_log).to_excel(writer, sheet_name='Ошибки', index=False)
-                        
-                    stats_data = {
-                        'Показатель': ['Файлов', 'Строк', 'Ошибок', 'Дата'],
-                        'Значение': [f"{processed_files}/{len(excel_files)}", len(all_data), 
-                                   len(self.error_log), datetime.now().strftime("%Y-%m-%d %H:%M:%S")]
-                    }
-                    pd.DataFrame(stats_data).to_excel(writer, sheet_name='Статистика', index=False)
-                    
-                self.log_message(f"Готово! Сохранено в {output_file}")
+                    # Статистика и ошибки (простая перезапись)
+                    if self.error_log or True:
+                        with pd.ExcelWriter(output_file, engine='openpyxl', mode='a', if_sheet_exists='replace') as writer:
+                            if self.error_log:
+                                pd.DataFrame(self.error_log).to_excel(writer, sheet_name='Ошибки', index=False)
+                            
+                            stats_data = {
+                                'Показатель': ['Файлов всего', 'Обработано новых', 'Строк извлечено', 'Ошибок', 'Дата'],
+                                'Значение': [len(excel_files), processed_files_count, len(all_data), 
+                                           len(self.error_log), datetime.now().strftime("%Y-%m-%d %H:%M:%S")]
+                            }
+                            pd.DataFrame(stats_data).to_excel(writer, sheet_name='Статистика', index=False)
+                else:
+                    # Fallback
+                    with pd.ExcelWriter(output_file, engine='openpyxl') as writer:
+                        df.to_excel(writer, sheet_name='Данные', index=False)
+                
+                self.log_message(f"Готово! Обработано новых файлов: {processed_files_count}. Всего строк в итоговом файле: {len(all_data)}")
             else:
-                self.log_message("Данные не найдены")
+                if processed_files_count == 0:
+                    self.log_message("Все файлы актуальны, новых данных не обнаружено.")
+                else:
+                    self.log_message("Данные в новых файлах не найдены.")
 
         except Exception as e:
             self.log_message(f"КРИТИЧЕСКАЯ ОШИБКА: {e}")
             traceback.print_exc()
+
+def clear_cache_for_output(output_file):
+    if CacheManager:
+        cache = CacheManager("green_table", output_file)
+        cache.clear_cache()

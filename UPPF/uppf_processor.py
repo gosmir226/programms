@@ -5,6 +5,17 @@ import re
 import json
 from datetime import datetime
 import math
+import sys
+
+# Добавляем родительскую директорию в путь для импорта общих модулей
+sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+try:
+    from excel_manager import ExcelManager
+    from cache_manager import CacheManager
+except ImportError:
+    # Фоллбек если пути не настроены (для тестов вне основной структуры)
+    ExcelManager = None
+    CacheManager = None
 
 def extract_before_date(text):
     # Паттерны для поиска дат в различных форматах
@@ -39,7 +50,7 @@ def extract_before_date(text):
     return ""
 
 def find_fill(data):
-    if data['ФОТОПИРОМЕТР'].isna().all():
+    if 'ФОТОПИРОМЕТР' not in data.columns or data['ФОТОПИРОМЕТР'].isna().all():
         return None
 
     # Убеждаемся, что индексы уникальны
@@ -90,53 +101,26 @@ def calculate_holding_time_and_pour_time(series, max_value, fill_index):
     time_to_pour = abs(fill_index - last_holding_index) * 5
     return holding_time, time_to_pour
 
-def determine_samples_by_temperature(files_data, log_callback):
-    """
-    Определение образцов по температуре заливки
-    Если температура заливки < 1500 - это "Образец", иначе "Нет"
-    """
-    result = {}
-    for item in files_data:
-        filename = item['filename']
-        fill_temp = item['fill_temperature']
-        
-        if fill_temp is not None and fill_temp < 1500:
-            result[filename] = "Образец"
-            log_callback(f"Файл {filename}: ОБРАЗЕЦ (температура заливки={fill_temp} < 1500)")
-        else:
-            result[filename] = "Нет"
-            if fill_temp is None:
-                log_callback(f"Файл {filename}: не образец (температура заливки отсутствует)")
-            else:
-                log_callback(f"Файл {filename}: не образец (температура заливки={fill_temp} >= 1500)")
-    
-    return result
-
 def process_files(input_directory, output_file_path, log_callback):
     log_callback("Начало обработки...")
     log_callback(f"Входная директория: {input_directory}")
     log_callback(f"Выходной файл: {output_file_path}")
     
-    # Определяем путь для кэш-файла
-    output_dir = os.path.dirname(output_file_path)
-    if not output_dir: # Handle case where output_file_path is just a filename
-        output_dir = os.getcwd()
+    # Инициализируем менеджеры
+    if CacheManager:
+        cache = CacheManager("UPPF", output_file_path)
+        cache_info = cache.get_cache_info()
+        log_callback(f"Загружен кэш, найдено {cache_info['file_count']} обработанных файлов")
+    else:
+        cache = None
+        log_callback("ВНИМАНИЕ: CacheManager не загружен, кэширование отключено")
         
-    cache_file_path = os.path.join(output_dir, 'casheUPPF.json')
+    if ExcelManager:
+        excel = ExcelManager(output_file_path)
+    else:
+        excel = None
+        log_callback("ВНИМАНИЕ: ExcelManager не загружен, умное сохранение отключено")
     
-    # Загружаем кэш, если он существует
-    processed_files_cache = set()
-    if os.path.exists(cache_file_path):
-        try:
-            with open(cache_file_path, 'r', encoding='utf-8') as f:
-                cached_data = json.load(f)
-                processed_files_cache = set(cached_data.get('processed_files', []))
-            log_callback(f"Загружен кэш из {cache_file_path}, найдено {len(processed_files_cache)} обработанных файлов")
-        except Exception as e:
-            log_callback(f"Ошибка при загрузке кэша: {e}")
-    
-    all_passport_headers = set()
-    all_temp_headers = set()
     all_rows = []
     
     # Проверяем существование директории
@@ -146,390 +130,259 @@ def process_files(input_directory, output_file_path, log_callback):
 
     file_count = 0
     processed_count = 0
-    newly_processed_files = []
     
+    files_to_process = []
     for root, dirs, files in os.walk(input_directory):
-        folder_name = os.path.basename(root)
-        log_callback(f"Обработка папки: {folder_name}")
+        for filename in files:
+            if filename.endswith(('.xlsx', '.xls')):
+                files_to_process.append(os.path.join(root, filename))
+    
+    files_to_process.sort()
+    total_files = len(files_to_process)
+    log_callback(f"Найдено {total_files} excel файлов для проверки")
+    
+    for file_path in files_to_process:
+        file_count += 1
+        filename = os.path.basename(file_path)
+        folder_name = os.path.basename(os.path.dirname(file_path))
         
-        # Сортируем excel файлы по возрастанию названия
-        excel_files = [f for f in files if f.endswith(('.xlsx', '.xls'))]
-        excel_files.sort()
+        # Проверяем, был ли файл уже обработан и не изменился ли он
+        if cache and not cache.is_file_changed(file_path):
+            # log_callback(f"Файл {file_count}/{total_files}: {filename} актуален в кэше, пропускаем")
+            continue
         
-        log_callback(f"Найдено {len(excel_files)} excel файлов в папке {folder_name}")
+        log_callback(f"Обработка файла {file_count}/{total_files}: {filename}")
         
-        for filename in excel_files:
-            file_count += 1
-            file_path = os.path.join(root, filename)
+        try:
+            engine = 'openpyxl' if filename.endswith('.xlsx') else 'xlrd'
             
-            # Проверяем, был ли файл уже обработан
-            if filename in processed_files_cache:
-                log_callback(f"Файл {file_count}: {filename} уже был обработан ранее, пропускаем")
+            # --- ОТЧЕТ ---
+            try:
+                df_report = pd.read_excel(file_path, sheet_name='ОТЧЕТ', engine=engine)
+                df_report = df_report.reset_index(drop=True)
+            except Exception as e:
+                log_callback(f"Файл {filename}: не удалось прочитать лист 'ОТЧЕТ': {e}")
                 continue
             
-            log_callback(f"Обработка файлa {file_count}: {filename}")
+            if df_report.empty:
+                log_callback(f"Файл {filename}: лист 'ОТЧЕТ' пустой")
+                continue
             
-            try:
-                engine = 'openpyxl' if filename.endswith('.xlsx') else 'xlrd'
-                
-                # --- ОТЧЕТ ---
-                try:
-                    df_report = pd.read_excel(file_path, sheet_name='ОТЧЕТ', engine=engine)
-                    df_report = df_report.reset_index(drop=True)
-                    log_callback(f"Файл {filename}: лист 'ОТЧЕТ' успешно прочитан")
-                except Exception as e:
-                    log_callback(f"Файл {filename}: не удалось прочитать лист 'ОТЧЕТ': {e}")
-                    continue
-                
-                if df_report.empty:
-                    log_callback(f"Файл {filename}: лист 'ОТЧЕТ' пустой")
-                    continue
-                
-                # Нормализация названий столбцов
-                df_report.columns = [str(col).strip().upper() for col in df_report.columns]
-                
-                # Проверка наличия столбца ПИРОМЕТР
-                if 'ПИРОМЕТР' not in df_report.columns:
-                    log_callback(f"Файл {filename}: не найден столбец 'ПИРОМЕТР' на листе 'ОТЧЕТ'. Пропуск.")
-                    continue
-                
-                # Обработка столбца ПИРОМЕТР
-                pyro_col = 'ПИРОМЕТР'
-                df_report[pyro_col] = (
-                    df_report[pyro_col]
-                    .astype(str)
-                    .str.replace(r'[^ -9.,-]', '', regex=True)
-                    .str.replace(',', '.')
-                    .replace('', np.nan)
-                )
-                df_report[pyro_col] = pd.to_numeric(df_report[pyro_col], errors='coerce')
-                
-                if df_report[pyro_col].isna().all():
-                    log_callback(f"Файл {filename}: в столбце 'ПИРОМЕТР' нет числовых данных")
-                    continue
-                
-                # Поиск первого значимого изменения температуры (>1°C)
-                temp_series = df_report[pyro_col]
-                first_change_idx = None
-                for i in range(1, len(temp_series)):
-                    current = temp_series.iloc[i]
-                    prev = temp_series.iloc[i-1]
-                    if pd.notna(current) and pd.notna(prev) and abs(current - prev) > 1:
-                        first_change_idx = i
-                        break
-                
-                if first_change_idx is None:
-                    log_callback(f"Файл {filename}: не найдено изменение температуры >1°C. Пропуск.")
-                    continue
-                
-                # --- find_fill с использованием столбца ПИРОМЕТР ---
-                def find_fill_wrapper(data):
-                    data = data.copy()
-                    data['ФОТОПИРОМЕТР'] = data[pyro_col]
-                    return find_fill(data)
-                
-                fill_index = find_fill_wrapper(df_report)
-                log_callback(f"Файл {filename}: fill_index={fill_index}")
-                
-                # --- Вычисление полного времени выдержки ---
-                full_holding_time = None
-                fill_temperature = None
-                
-                if fill_index is not None:
-                    max_temp_index = df_report[pyro_col].idxmax()
-                    if fill_index >= max_temp_index:
-                        full_holding_time = (fill_index - max_temp_index) * 5
-                    fill_temperature = df_report.loc[fill_index, pyro_col]
-                
-                # --- PT6 ---
-                pt6_col = None
-                for col in df_report.columns:
-                    if str(col).strip() == 'PT6':
-                        pt6_col = col
-                        break
-                    if str(col).strip() == 'PT6 ':
-                        pt6_col = col
-                        break
-                if pt6_col is None:
-                    log_callback(f"Файл {filename}: не найден столбец 'PT6'. Пропуск.")
-                    continue
-                
-                minPT6, maxPT6 = None, None
-                if fill_index is not None:
-                    interval = df_report.loc[first_change_idx:fill_index]
-                    minPT6 = interval[pt6_col].min() if not interval[pt6_col].isnull().all() else None
-                    maxPT6 = interval[pt6_col].max() if not interval[pt6_col].isnull().all() else None
+            # Нормализация названий столбцов
+            df_report.columns = [str(col).strip().upper() for col in df_report.columns]
+            
+            # Проверка наличия столбца ПИРОМЕТР
+            if 'ПИРОМЕТР' not in df_report.columns:
+                log_callback(f"Файл {filename}: не найден столбец 'ПИРОМЕТР' на листе 'ОТЧЕТ'")
+                continue
+            
+            # Обработка столбца ПИРОМЕТР
+            pyro_col = 'ПИРОМЕТР'
+            df_report[pyro_col] = (
+                df_report[pyro_col]
+                .astype(str)
+                .str.replace(r'[^ -9.,-]', '', regex=True)
+                .str.replace(',', '.')
+                .replace('', np.nan)
+            )
+            df_report[pyro_col] = pd.to_numeric(df_report[pyro_col], errors='coerce')
+            
+            if df_report[pyro_col].isna().all():
+                log_callback(f"Файл {filename}: в 'ПИРОМЕТР' нет числовых данных")
+                continue
+            
+            # Поиск первого значимого изменения температуры (>1°C)
+            temp_series = df_report[pyro_col]
+            first_change_idx = None
+            for i in range(1, len(temp_series)):
+                current = temp_series.iloc[i]
+                prev = temp_series.iloc[i-1]
+                if pd.notna(current) and pd.notna(prev) and abs(current - prev) > 1:
+                    first_change_idx = i
+                    break
+            
+            if first_change_idx is None:
+                log_callback(f"Файл {filename}: не найдено изменение температуры >1°C")
+                continue
+            
+            # Поиск заливки
+            def find_fill_wrapper(data):
+                data = data.copy()
+                data['ФОТОПИРОМЕТР'] = data[pyro_col]
+                return find_fill(data)
+            
+            fill_index = find_fill_wrapper(df_report)
+            
+            # Вычисление времени
+            full_holding_time = None
+            fill_temperature = None
+            if fill_index is not None:
+                max_temp_index = df_report[pyro_col].idxmax()
+                if fill_index >= max_temp_index:
+                    full_holding_time = (fill_index - max_temp_index) * 5
+                fill_temperature = df_report.loc[fill_index, pyro_col]
+            
+            # RT6 / PT6
+            pt6_col = None
+            for col in df_report.columns:
+                if str(col).strip() in ['PT6', 'PT6 ']:
+                    pt6_col = col
+                    break
+            
+            minPT6, maxPT6 = None, None
+            if pt6_col is not None and fill_index is not None:
+                interval = df_report.loc[first_change_idx:fill_index]
+                minPT6 = interval[pt6_col].min() if not interval[pt6_col].isnull().all() else None
+                maxPT6 = interval[pt6_col].max() if not interval[pt6_col].isnull().all() else None
 
-                # --- ПАСПОРТ ---
-                passport_dict = {}
-                furnace_type = None
-                try:
-                    df_passport = pd.read_excel(file_path, sheet_name='ПАСПОРТ', engine=engine, header=None)
-                    if df_passport.shape[0] >= 2:
-                        df_passport = df_passport.T
-                        passport_headers = list(df_passport.iloc[0])
-                        passport_values = list(df_passport.iloc[1])
-                        
-                        # Создаем словарь с заголовками в верхнем регистре
-                        temp_passport_dict = {str(k).strip().upper(): v for k, v in zip(passport_headers, passport_values)}
-                        
-                        # Определяем тип печи на основе объема камеры
-                        volume = temp_passport_dict.get('ОБЪЕМ КАМЕРЫ:', '')
-                        if volume == '3700(Liter)':
-                            furnace_type = 'УППФ-У'
-                        else:
-                            furnace_type = 'УППФ-50'
-                        
-                        # Добавляем тип печи в словарь
-                        passport_dict['ПЕЧЬ'] = furnace_type
-                        
-                        # Всегда добавляем эти столбцы
-                        for key in ['НАЧАЛО ЗАПИСИ:', 'ЗАВЕРШЕНИЕ ЗАПИСИ:']:
+            # --- ПАСПОРТ ---
+            passport_dict = {}
+            furnace_type = None
+            try:
+                df_passport = pd.read_excel(file_path, sheet_name='ПАСПОРТ', engine=engine, header=None)
+                if df_passport.shape[0] >= 2:
+                    df_passport = df_passport.T
+                    passport_headers = list(df_passport.iloc[0])
+                    passport_values = list(df_passport.iloc[1])
+                    temp_passport_dict = {str(k).strip().upper(): v for k, v in zip(passport_headers, passport_values)}
+                    
+                    volume = temp_passport_dict.get('ОБЪЕМ КАМЕРЫ:', '')
+                    furnace_type = 'УППФ-У' if volume == '3700(Liter)' else 'УППФ-50'
+                    passport_dict['ПЕЧЬ'] = furnace_type
+                    
+                    for key in ['НАЧАЛО ЗАПИСИ:', 'ЗАВЕРШЕНИЕ ЗАПИСИ:']:
+                        if key in temp_passport_dict:
+                            passport_dict[key] = temp_passport_dict[key]
+                    
+                    if furnace_type == 'УППФ-50':
+                        for key in ['ДАТА ПРОВЕРКИ НАТЕКАНИЯ:', 'ВАКУУМ В НАЧАЛЕ ИЗМЕРЕНИЯ:', 'ВАКУУМ В КОНЦЕ ИЗМЕРЕНИЯ:', 'ВРЕМЯ ИЗМЕРЕНИЯ:', 'ОБЪЕМ КАМЕРЫ:', 'УРОВЕНЬ НАТЕКАНИЯ:', 'МИН. ВАКУУМ ВО ВРЕМЯ ПРОВЕРКИ:', 'МИН. ВАКУУМ ПЕРЕД ПРОВЕРКОЙ:']:
                             if key in temp_passport_dict:
                                 passport_dict[key] = temp_passport_dict[key]
-                        
-                        # Для УППФ-50 добавляем дополнительные столбцы
-                        if furnace_type == 'УППФ-50':
-                            additional_keys = [
-                                'ДАТА ПРОВЕРКИ НАТЕКАНИЯ:',
-                                'ВАКУУМ В НАЧАЛЕ ИЗМЕРЕНИЯ:',
-                                'ВАКУУМ В КОНЦЕ ИЗМЕРЕНИЯ:',
-                                'ВРЕМЯ ИЗМЕРЕНИЯ:',
-                                'ОБЪЕМ КАМЕРЫ:',
-                                'УРОВЕНЬ НАТЕКАНИЯ:',
-                                'МИН. ВАКУУМ ВО ВРЕМЯ ПРОВЕРКИ:',
-                                'МИН. ВАКУУМ ПЕРЕД ПРОВЕРКОЙ:'
-                            ]
-                            for key in additional_keys:
-                                if key in temp_passport_dict:
-                                    passport_dict[key] = temp_passport_dict[key]
-                        
-                        all_passport_headers.update(passport_dict.keys())
-                        log_callback(f"Файл {filename}: лист 'ПАСПОРТ' успешно обработан, тип печи: {furnace_type}")
-                except Exception as e:
-                    log_callback(f"Файл {filename}: не удалось прочитать лист 'ПАСПОРТ': {e}")
-
-                # --- ТЕМПЕРАТУРА ---
-                temp_row_dict = {}
-                max_overheat_temp = None
-                try:
-                    df_temp = pd.read_excel(file_path, sheet_name='ТЕМПЕРАТУРА', engine=engine)
-                    df_temp = df_temp.reset_index(drop=True)
-                    
-                    # Нормализуем названия столбцов к верхнему регистру
-                    df_temp.columns = [str(col).strip().upper() for col in df_temp.columns]
-                    
-                    # Обработка ФОТОПИРОМЕТР для расчетов (но не для вывода)
-                    if 'ФОТОПИРОМЕТР' in df_temp.columns:
-                        df_temp['ФОТОПИРОМЕТР'] = df_temp['ФОТОПИРОМЕТР'].astype(str).replace(r'[^ -9.,-]', '', regex=True)
-                        df_temp['ФОТОПИРОМЕТР'] = df_temp['ФОТОПИРОМЕТР'].str.replace(',', '.')
-                        df_temp['ФОТОПИРОМЕТР'] = pd.to_numeric(df_temp['ФОТОПИРОМЕТР'], errors='coerce')
-                        
-                        if not df_temp['ФОТОПИРОМЕТР'].isnull().all():
-                            max_overheat_temp = df_temp['ФОТОПИРОМЕТР'].max()
-                    
-                    # Добавляем индекс для поиска
-                    df_temp['Index'] = df_temp.index
-                    
-                    # Берем только нужные столбцы для вывода
-                    target_columns = ['ТППФ ВЕРХ (Т2)', 'ТППФ НИЗ (Т3)', 'ТППФ СР (Т4)']
-                    
-                    if fill_index in df_temp['Index'].values:
-                        temp_row = df_temp.loc[df_temp['Index'] == fill_index].iloc[0]
-                        # Берем только указанные столбцы
-                        for col in target_columns:
-                            if col in df_temp.columns:
-                                temp_row_dict[col] = temp_row[col]
-                        
-                        all_temp_headers.update(target_columns)
-                        
-                    log_callback(f"Файл {filename}: лист 'ТЕМПЕРАТУРА' успешно обработан, max_overheat_temp={max_overheat_temp}")
-                except Exception as e:
-                    log_callback(f"Файл {filename}: не удалось прочитать лист 'ТЕМПЕРАТУРА': {e}")
-
-                # --- holding_time и time_to_pour ---
-                holding_time, time_to_pour = None, None
-                try:
-                    if 'df_temp' in locals() and fill_index is not None:
-                        if 'max_overheat_temp' in locals() and max_overheat_temp is not None:
-                            max_value = max_overheat_temp
-                        elif 'ФОТОПИРОМЕТР' in locals() and not df_temp['ФОТОПИРОМЕТР'].isnull().all():
-                            max_value = df_temp['ФОТОПИРОМЕТР'].max()
-                        else:
-                            max_value = None
-                            
-                        if max_value is not None:
-                            holding_time, time_to_pour = calculate_holding_time_and_pour_time(
-                                df_temp['ФОТОПИРОМЕТР'],
-                                max_value,
-                                fill_index
-                            )
-                except Exception as e:
-                    log_callback(f"Ошибка расчета времени для {filename}: {e}")
-
-                # --- Итоговая строка ---
-                heat_name = extract_before_date(folder_name)
-                row = {
-                    'Плавка': heat_name,
-                    'minPT6': minPT6,
-                    'maxPT6': maxPT6,
-                    'Температура перегрева': max_overheat_temp,
-                    'Температура заливки': fill_temperature,
-                    'Время выдержки при перегреве': holding_time,
-                    'Время от конца выдержки до заливки': time_to_pour,
-                    'Полное время выдержки': full_holding_time,
-                    'Название файла': filename,
-                    'Путь до файла excel': file_path
-                }
-                
-                # Добавляем данные из паспорта и температуры
-                for source_dict in [passport_dict, temp_row_dict]:
-                    for key, value in source_dict.items():
-                        if key not in row:
-                            row[key] = value
-                
-                all_rows.append(row)
-                
-                processed_count += 1
-                newly_processed_files.append(filename)
-                log_callback(f"Файл {filename}: успешно обработан")
-                
-
-                    
             except Exception as e:
-                log_callback(f"Ошибка при обработке файла {filename}: {e}")
-                import traceback
-                log_callback(f"Подробности ошибки: {traceback.format_exc()}")
+                # log_callback(f"Файл {filename}: ошибка листа 'ПАСПОРТ': {e}")
+                pass
 
-    log_callback(f"Обработка завершена. Обработано {processed_count} из {file_count} файлов")
-    
-    # Обновляем кэш
-    if newly_processed_files:
-        processed_files_cache.update(newly_processed_files)
-        cache_data = {
-            'processed_files': list(processed_files_cache),
-            'last_update': datetime.now().isoformat(),
-            'total_processed': len(processed_files_cache)
-        }
-        try:
-            with open(cache_file_path, 'w', encoding='utf-8') as f:
-                json.dump(cache_data, f, ensure_ascii=False, indent=2)
+            # --- ТЕМПЕРАТУРА ---
+            temp_row_dict = {}
+            max_overheat_temp = None
+            photo_vals = None
+            try:
+                df_temp = pd.read_excel(file_path, sheet_name='ТЕМПЕРАТУРА', engine=engine)
+                df_temp = df_temp.reset_index(drop=True)
+                df_temp.columns = [str(col).strip().upper() for col in df_temp.columns]
+                
+                if 'ФОТОПИРОМЕТР' in df_temp.columns:
+                    photo_vals = pd.to_numeric(df_temp['ФОТОПИРОМЕТР'].astype(str).str.replace(',', '.'), errors='coerce')
+                    if not photo_vals.isnull().all():
+                        max_overheat_temp = photo_vals.max()
+                
+                if fill_index is not None and fill_index < len(df_temp):
+                    target_columns = ['ТППФ ВЕРХ (Т2)', 'ТППФ НИЗ (Т3)', 'ТППФ СР (Т4)']
+                    for col in target_columns:
+                        if col in df_temp.columns:
+                            temp_row_dict[col] = df_temp.loc[fill_index, col]
+                
+                # holding_time и time_to_pour
+                holding_time, time_to_pour = None, None
+                if fill_index is not None and photo_vals is not None:
+                    max_val = max_overheat_temp if max_overheat_temp is not None else photo_vals.max()
+                    if max_val is not None:
+                        holding_time, time_to_pour = calculate_holding_time_and_pour_time(photo_vals, max_val, fill_index)
+            except Exception as e:
+                # log_callback(f"Файл {filename}: ошибка листа 'ТЕМПЕРАТУРА': {e}")
+                pass
+
+            # --- Итоговая строка ---
+            heat_name = extract_before_date(folder_name)
+            row = {
+                'Плавка': heat_name,
+                'minPT6': minPT6,
+                'maxPT6': maxPT6,
+                'Температура перегрева': max_overheat_temp,
+                'Температура заливки': fill_temperature,
+                'Время выдержки при перегреве': holding_time if 'holding_time' in locals() else None,
+                'Время от конца выдержки до заливки': time_to_pour if 'time_to_pour' in locals() else None,
+                'Полное время выдержки': full_holding_time,
+                'Название файла': filename,
+                'Путь до файла excel': file_path
+            }
+            
+            row.update(passport_dict)
+            row.update(temp_row_dict)
+            
+            all_rows.append(row)
+            processed_count += 1
+            if cache:
+                cache.update_file(file_path)
+            
         except Exception as e:
-            log_callback(f"Ошибка при сохранении кэша: {e}")
-    
-    if processed_count == 0:
-        log_callback("ВНИМАНИЕ: Ни один файл не был обработан! Проверьте логи для выяснения причин.")
+            log_callback(f"Ошибка при обработке файла {filename}: {e}")
+
+    if not all_rows and processed_count == 0:
+        log_callback("Нет новых данных для обработки.")
         return
 
-    # Формируем итоговую таблицу
-    # Сначала собираем все заголовки из всех строк
-    all_headers = set()
-    for row in all_rows:
-        all_headers.update(row.keys())
-    
-    # Создаем упорядоченный список колонок, где обязательные поля идут первыми
-    mandatory_columns = [
-        'Плавка', 'Порядок заливки', 'Образец', 'Температура перегрева', 'Температура заливки',
-        'Время выдержки при перегреве', 'Время от конца выдержки до заливки',
-        'ТППФ ВЕРХ (Т2)', 'ТППФ НИЗ (Т3)', 'ТППФ СР (Т4)',
-        'minPT6', 'maxPT6'
-    ]
-    
-    # Удаляем обязательные колонки из общего набора, чтобы не дублировать
-    for col in mandatory_columns:
-        if col in all_headers:
-            all_headers.remove(col)
-    
-    # Формируем окончательный список колонок
-    columns = mandatory_columns + sorted(all_headers)
-    
-    # Создаем DataFrame
-    final_result = pd.DataFrame(all_rows, columns=columns)
+    # Формируем DataFrame
+    final_result = pd.DataFrame(all_rows)
     
     # Добавляем гиперссылки
-    if not final_result.empty:
+    if not final_result.empty and 'Название файла' in final_result.columns:
         final_result['Название файла'] = final_result.apply(
-            lambda row: f'=HYPERLINK("{row["Путь до файла excel"]}", "{row["Название файла"]}")', axis=1)
+            lambda r: f'=HYPERLINK("{r["Путь до файла excel"]}", "{r["Название файла"]}")', axis=1)
+
+    # Умное сохранение
+    log_callback("Слияние новых данных с существующими...")
     
-    try:
-        if os.path.exists(output_file_path):
-            existing_data = pd.read_excel(output_file_path)
-            existing_data = existing_data.reset_index(drop=True)
-            log_callback(f"Обнаружен существующий файл, загружено {len(existing_data)} строк")
-            combined_data = pd.concat([existing_data, final_result], ignore_index=True)
-            before_deduplication = len(combined_data)
+    # Читаем существующие
+    if excel:
+        existing_df, metadata = excel.read_excel_smart()
+    else:
+        existing_df = pd.DataFrame()
 
-            # Формируем ключ для дедупликации (нормализованный путь)
-            dedup_col = 'dedup_key'
-            if 'Путь до файла excel' in combined_data.columns:
-                combined_data[dedup_col] = combined_data['Путь до файла excel'].astype(str).str.lower().str.replace(r'[\\/]', r'\\', regex=True).str.strip()
-            else:
-                # Если вдруг нет пути - используем название (с гиперссылкой)
-                combined_data[dedup_col] = combined_data['Название файла'].astype(str).str.strip()
-            
-            combined_data = combined_data.drop_duplicates(subset=[dedup_col], keep='last')
-            combined_data = combined_data.drop(columns=[dedup_col])
-            
-            after_deduplication = len(combined_data)
-            log_callback(f"После объединения: {before_deduplication} строк, после удаления дубликатов: {after_deduplication} строк")
-            
-            df_to_process = combined_data
-        else:
-            df_to_process = final_result
-            log_callback(f"Создан новый файл с результатами: {output_file_path}")
+    if not existing_df.empty:
+        combined = pd.concat([existing_df, final_result], ignore_index=True)
+        if 'Путь до файла excel' in combined.columns:
+            combined['dedup_key'] = combined['Путь до файла excel'].astype(str).str.lower().str.replace(r'[\\/]', r'\\', regex=True).str.strip()
+            combined = combined.drop_duplicates(subset=['dedup_key'], keep='last').drop(columns=['dedup_key'])
+    else:
+        combined = final_result
 
-        # --- Сортировка и добавление 'Порядок заливки' ---
-        if 'НАЧАЛО ЗАПИСИ:' in df_to_process.columns and 'Плавка' in df_to_process.columns:
-            # Временный столбец для даты
-            df_to_process['temp_sort_date'] = pd.to_datetime(
-                df_to_process['НАЧАЛО ЗАПИСИ:'], 
-                dayfirst=True, 
-                errors='coerce'
-            )
-            
-            # Сортировка
-            df_to_process = df_to_process.sort_values(by=['Плавка', 'temp_sort_date'])
-            
-            # Вычисление порядка
-            df_to_process['Порядок заливки'] = df_to_process.groupby('Плавка').cumcount() + 1
-            
-            # Удаление временного столбца
-            df_to_process = df_to_process.drop(columns=['temp_sort_date'])
-            log_callback("Выполнена хронологическая сортировка и индексация по плавке")
+    # Сортировка и расчеты на всем наборе
+    if not combined.empty and 'НАЧАЛО ЗАПИСИ:' in combined.columns and 'Плавка' in combined.columns:
+        combined['temp_sort_date'] = pd.to_datetime(combined['НАЧАЛО ЗАПИСИ:'], dayfirst=True, errors='coerce')
+        combined = combined.sort_values(by=['Плавка', 'temp_sort_date'])
+        combined['Порядок заливки'] = combined.groupby('Плавка').cumcount() + 1
+        
+        combined['Образец'] = ""
+        for heat_name, group in combined.groupby('Плавка'):
+            try:
+                idx_max_order = group['Порядок заливки'].idxmax()
+                combined.at[idx_max_order, 'Образец'] = "Предполагаемый образец"
+                
+                if 'Температура заливки' in group.columns and group['Температура заливки'].notna().any():
+                    min_temp = group['Температура заливки'].min()
+                    if min_temp < 1500:
+                        min_temp_indices = group[group['Температура заливки'] == min_temp].index
+                        for idx in min_temp_indices:
+                            current = combined.at[idx, 'Образец']
+                            label = "Минимальная температура заливки"
+                            combined.at[idx, 'Образец'] = f"{current}, {label}" if current else label
+            except Exception: pass
+        
+        combined = combined.drop(columns=['temp_sort_date'])
 
-            # --- Расчет столбца "Образец" ---
-            df_to_process['Образец'] = ""
-            # Группируем по плавке
-            for heat_name, group in df_to_process.groupby('Плавка'):
-                try:
-                    # 1. Последний по времени (максимальный порядок заливки)
-                    if 'Порядок заливки' in group.columns and not group.empty:
-                        idx_max_order = group['Порядок заливки'].idxmax()
-                        if pd.notna(idx_max_order):
-                            df_to_process.at[idx_max_order, 'Образец'] = "Предполагаемый образец"
-                    
-                    # 2. Минимальная температура заливки
-                    if 'Температура заливки' in group.columns and group['Температура заливки'].notna().any():
-                        min_temp = group['Температура заливки'].min()
-                        # Дополнительная проверка на < 1500
-                        if min_temp < 1500:
-                            # Находим все индексы с этой минимальной температурой
-                            min_temp_indices = group[group['Температура заливки'] == min_temp].index
-                            for idx in min_temp_indices:
-                                current_val = df_to_process.at[idx, 'Образец']
-                                label = "Минимальная температура заливки"
-                                if current_val and current_val != label:
-                                    df_to_process.at[idx, 'Образец'] = f"{current_val}, {label}"
-                                else:
-                                    df_to_process.at[idx, 'Образец'] = label
-                except Exception as e_sample:
-                    log_callback(f"Ошибка при расчете образца для плавки {heat_name}: {e_sample}")
-            
-            log_callback("Столбец 'Образец' заполнен")
-
-        df_to_process.to_excel(output_file_path, index=False)
-        log_callback(f"Данные сохранены в файл: {output_file_path}")
-        log_callback(f"Всего строк в результате: {len(df_to_process)}")
-
-    except Exception as e:
-        log_callback(f"Ошибка при сохранении результата: {e}")
+    # Записываем
+    if excel:
+        success = excel.write_excel_smart(
+            combined, 
+            key_columns=['Путь до файла excel'],
+            log_callback=log_callback
+        )
+    else:
+        combined.to_excel(output_file_path, index=False)
+        success = True
+    
+    if success:
+        log_callback(f"Успешно обработано: {processed_count} новых файлов")
+    else:
+        log_callback("Ошибка при сохранении Excel файла")

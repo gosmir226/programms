@@ -2,6 +2,7 @@ import sys
 import threading
 import os
 import json
+import time
 from PyQt6.QtWidgets import (
     QApplication, QWidget, QLabel, QLineEdit, QPushButton,
     QFileDialog, QTextEdit, QVBoxLayout, QHBoxLayout,
@@ -9,8 +10,15 @@ from PyQt6.QtWidgets import (
 )
 from PyQt6.QtCore import Qt, pyqtSignal
 
+# Добавляем родительскую директорию в путь для импорта общих модулей
+sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+try:
+    from cache_manager import CacheManager
+except ImportError:
+    CacheManager = None
+
 # Import logic from the processor file
-from termodat_processor import TermodatProcessor
+from termodat_processor import TermodatProcessor, clear_cache_for_output
 
 # === UNIFIED THEME CONSTANTS ===
 THEME_STYLESHEET = """
@@ -298,7 +306,11 @@ class TermodatApp(QWidget):
         self.log_text.setReadOnly(True)
         main_layout.addWidget(self.log_text)
 
-        folder = QFileDialog.getExistingDirectory(self, "Выберите входную директорию")
+    def select_input_folder(self):
+        current_path = self.input_path.text().strip()
+        start_dir = current_path if current_path and os.path.exists(current_path) else ""
+        
+        folder = QFileDialog.getExistingDirectory(self, "Выберите входную директорию", start_dir)
         if folder:
             self.input_path.setText(folder)
             self.save_last_paths()
@@ -338,16 +350,15 @@ class TermodatApp(QWidget):
             QMessageBox.warning(self, "Ошибка", "Укажите выходную папку для очистки кэша!")
             return
             
-        cache_file = os.path.join(out_dir, '.processing_cache.json')
-        if os.path.exists(cache_file):
-            try:
-                os.remove(cache_file)
-                self.log_text.append("✅ Кэш успешно очищен.")
-                QMessageBox.information(self, "Успех", "Кэш очищен.")
-            except Exception as e:
-                QMessageBox.critical(self, "Ошибка", f"Не удалось удалить кэш: {e}")
-        else:
-            QMessageBox.information(self, "Инфо", "Файл кэша не найден.")
+        reply = QMessageBox.question(self, 'Очистка кэша', 
+                                   f"Вы уверены, что хотите очистить кэш для этой директории?\nЭто приведет к полной перечитке всех данных при следующем запуске.",
+                                   QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No, 
+                                   QMessageBox.StandardButton.No)
+        
+        if reply == QMessageBox.StandardButton.Yes:
+            clear_cache_for_output(out_dir)
+            self.log_text.append(f"[{time.strftime('%H:%M:%S')}] ✅ Кэш успешно очищен.")
+            QMessageBox.information(self, "Успех", "Кэш очищен.")
 
     def start_processing(self):
         input_dir = self.input_path.text().strip()
