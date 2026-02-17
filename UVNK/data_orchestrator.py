@@ -77,23 +77,32 @@ def read_tdms_file(file_path):
 def merge_dataframes(df_reports, df_pasport):
     """
     Объединяет данные из Reports и Pasport.
-    Предполагается, что у них одинаковое количество строк и есть столбец 'NumberOfM'.
+    Переносит все уникальные колонки из Pasport (например, Дату) в Reports.
+    Если есть NumberOfM, приоритет отдается данным из Pasport.
     """
-    if 'NumberOfM' not in df_pasport.columns:
-        raise ValueError("Столбец 'NumberOfM' не найден в Pasport")
-
-    if len(df_reports) == 0 or len(df_pasport) == 0:
-        raise ValueError("Один из DataFrame пуст")
-
-    number_of_m = df_pasport['NumberOfM'].iloc[0]
+    if df_reports is None or len(df_reports) == 0:
+        return None
+    
     df_reports_copy = df_reports.copy()
-    df_reports_copy['NumberOfM'] = number_of_m
+    
+    if df_pasport is None or df_pasport.empty:
+        return df_reports_copy
 
-    pasport_cols = [c for c in df_pasport.columns if c not in df_reports_copy.columns]
-    for col in pasport_cols:
-        df_reports_copy[col] = df_pasport[col].iloc[0]
+    # 1. Обрабатываем NumberOfM (если есть в паспорте)
+    if 'NumberOfM' in df_pasport.columns and not df_pasport['NumberOfM'].empty:
+        df_reports_copy['NumberOfM'] = df_pasport['NumberOfM'].iloc[0]
+    
+    # 2. Переносим все остальные уникальные колонки из Pasport
+    for col in df_pasport.columns:
+        # Если колонки нет ИЛИ она состоит из NaN (пустая заготовка)
+        if col not in df_reports_copy.columns or df_reports_copy[col].isna().all():
+            if not df_pasport[col].empty:
+                # Распространяем первое значение на все строки (метаданные)
+                df_reports_copy[col] = df_pasport[col].iloc[0]
 
     return df_reports_copy
+
+
 
 def process_session_to_excel(root_folder, output_excel_path, log_callback):
     """
@@ -218,8 +227,11 @@ def process_session_to_excel(root_folder, output_excel_path, log_callback):
                     df_pasport = read_tdms_file(pasport_path)
                     merged_df = None
                     if df_pasport is not None and not df_pasport.empty:
-                        try: merged_df = merge_dataframes(df_reports, df_pasport)
-                        except: merged_df = None
+                        try: 
+                            merged_df = merge_dataframes(df_reports, df_pasport)
+                        except Exception as e:
+                            log_callback(f"Предупреждение: Не удалось объединить {filename} с паспортом: {e}")
+                            merged_df = None
                     if merged_df is None:
                         merged_df = df_reports.copy()
                         merged_df['NumberOfM'] = os.path.splitext(filename)[0]
@@ -244,12 +256,17 @@ def process_session_to_excel(root_folder, output_excel_path, log_callback):
                 continue
 
             df_pasport = read_tdms_file(pasport_path)
-            merged_df = None
             if df_pasport is not None and not df_pasport.empty:
-                try: merged_df = merge_dataframes(df_reports, df_pasport)
-                except: merged_df = None
+                try: 
+                    merged_df = merge_dataframes(df_reports, df_pasport)
+                except Exception as e:
+                    log_callback(f"Ошибка объединения {filename} с паспортом: {e}")
+                    merged_df = None
+            else:
+                log_callback(f"Предупреждение: Файл паспорта для {filename} пуст или не прочитан.")
             
             if merged_df is None:
+                log_callback(f"Используются только данные из Reports для {filename}")
                 merged_df = df_reports.copy()
                 merged_df['NumberOfM'] = os.path.splitext(filename)[0]
 
